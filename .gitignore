@@ -1,0 +1,40 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Ambientes virtuais
+.venv/
+venv/
+env/
+ENV/
+
+# Bases de dados e relatórios de colaboradores (dados sensíveis)
+*.csv
+*.CSV
+*.xlsx
+*.xls
+FPRE111-*.csv
+importar-usuarios*.csv
+
+# Pastas de exportações por data (ex: 16-03, 26-03, etc.)
+[0-9][0-9]-[0-9][0-9]/
+
+# Logs e arquivos temporários
+logs/
+*.log
+_tmp_local/
+*.tmp
+*.bak
+umu_env.tmp
+
+# Credenciais e configurações locais
+.env
+.env.*
+*.credentials
+
+# Arquivos de IDE e SO
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
