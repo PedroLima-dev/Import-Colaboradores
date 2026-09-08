@@ -7,6 +7,7 @@ Uso: python gerar_importar_usuarios.py <arquivo_FPRE111.XLS> [data_admissao]
 - Aplica todas as transformações de campos conforme mapeamento identificado.
 """
 
+import re
 import sys
 import os
 import shutil
@@ -17,11 +18,16 @@ import pandas as pd
 from contextlib import contextmanager
 from datetime import datetime
 
+# ─── Resolução de diretório base (PyInstaller / Script) ──────────────────────
+def _obter_dir_base():
+    """Retorna o diretório base da aplicação (onde o .exe ou o .py está localizado)."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
 # ─── Segurança: isola arquivos de rede ───────────────────────────────────────
 
-DIR_LOCAL_SEGURO = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "_tmp_local"
-)
+DIR_LOCAL_SEGURO = os.path.join(_obter_dir_base(), "_tmp_local")
 
 @contextmanager
 def arquivo_local_seguro(path):
@@ -210,7 +216,7 @@ FILIAL_MARCA = {
     "UMUARAMA MOTORS COMERCIO E SERVIÇOS LTDA": "TOYOTA",
     "UMUARAMA AUTOS LTDA": "VOLKS",
     "UMUARAMA AUTOMOVEIS LTDA": "FIAT",
-    "UMUARAMA AUTOMOTORES": "JEEP E RAM",
+    "UMUARAMA AUTOMOTORES LTDA": "JEEP E RAM",
     "UMUARAMA VEICULOS LTDA": "KIA",
     "UMUARAMA MOTOCICLETAS LTDA": "TRIUMPH",
     "UMUARAMA MOTOS LTDA": "HD",
@@ -290,18 +296,10 @@ SUBUNIDADE_MAP = {
     # Cedilha
     "URUA\u00c7U"                   : "URUACU",
     "URUACU"                    : "URUACU",
+    # Redenção
+    "REDEN\u00c7\u00c3O"                  : "REDENCAO",
+    "REDENCAO"                  : "REDENCAO",
 }
-
-
-def converter_xls_para_xlsx(xls_path):
-    """Converte .XLS para .xlsx usando LibreOffice."""
-    out_dir = "/home/claude"
-    subprocess.run(
-        ["libreoffice", "--headless", "--convert-to", "xlsx", xls_path, "--outdir", out_dir],
-        check=True, capture_output=True
-    )
-    base = os.path.splitext(os.path.basename(xls_path))[0]
-    return os.path.join(out_dir, base + ".xlsx")
 
 
 def normalizar_depto(centro_custo):
@@ -322,12 +320,12 @@ def normalizar_subunidade(local):
 
 
 def montar_unidade(filial, local):
-    """Constrói o campo 'unidade' = marca + ' - ' + LOCAL normalizado, ou só 'HOLDING UAC'."""
+    """Constrói o campo 'unidade' = marca + ' - ' + LOCAL normalizado, ou só a marca para HOLDING e CORRETORA."""
     filial = str(filial).strip() if not pd.isna(filial) else ""
     local_norm = normalizar_subunidade(local)
     marca = FILIAL_MARCA.get(filial, filial)
-    if marca == "HOLDING UAC":
-        return "HOLDING UAC"
+    if marca in ("HOLDING UAC", "HOLDING UAP", "CORRETORA DE SEGUROS", "CORRETORA"):
+        return marca
     return f"{marca} - {local_norm}" if local_norm else marca
 
 
@@ -344,6 +342,140 @@ def limpar_telefone(numero):
     return s
 
 
+CARGOS_ESPECIFICOS = [
+    "AUXILIAR DE OFICINA", "MECANICO", "MOTORISTA", "PINTOR",
+    "ALINHADOR DE VEICULOS", "AUXILIAR DE PINTOR", "COPEIRA",
+    "LAVADOR", "PORTEIRO", "VIGIA", "SERVICOS GERAIS",
+]
+
+
+def remover_pontuacao(val):
+    if isinstance(val, str):
+        return re.sub(r"[^\w\s@.\-/()\u00C0-\u00FF]", "", val)
+    return val
+
+
+ESTADO_CIVIL_MAP = {
+    "DIVOLCIADO": "Divorciado",
+    "DIVOLCIADA": "Divorciada",
+    "DIVORCIADO": "Divorciado",
+    "DIVORCIADA": "Divorciada",
+    "SOLTEIRO": "Solteiro",
+    "SOLTEIRA": "Solteira",
+    "CASADO": "Casado",
+    "CASADA": "Casada",
+    "SEPARADO": "Separado",
+    "SEPARADA": "Separada",
+    "VIUVO": "Viuvo",
+    "VIUVA": "Viuva",
+    "VIÚVO": "Viuvo",
+    "VIÚVA": "Viuva",
+    "UNIAO ESTAVEL": "Uniao Estavel",
+    "UNIÃO ESTÁVEL": "Uniao Estavel",
+}
+
+def normalizar_estado_civil(val):
+    """Padroniza o estado civil e corrige erros comuns de digitação como Divolciado."""
+    if pd.isna(val) or not str(val).strip():
+        return ""
+    s = str(val).strip()
+    s_norm = _remover_acentos(s.upper())
+    s_norm_corrigido = s_norm.replace("DIVOL", "DIVOR")
+    if s_norm_corrigido in ESTADO_CIVIL_MAP:
+        return ESTADO_CIVIL_MAP[s_norm_corrigido]
+    if s_norm in ESTADO_CIVIL_MAP:
+        return ESTADO_CIVIL_MAP[s_norm]
+    return re.sub(r'(?i)divol', 'Divor', s)
+
+def _montar_linha_dict(r, admissao, modo_uap=False):
+    unidade = montar_unidade(r.get("FILIAL"), r.get("LOCAL"))
+    departamento = normalizar_depto(r.get("CENTRO DE CUSTO"))
+    subunidade = normalizar_subunidade(r.get("LOCAL", ""))
+    telefone = limpar_telefone(r.get("CELULAR"))
+    tel_val = "" if modo_uap else telefone
+    cel_val = telefone if modo_uap else ""
+    return {
+        "nome": r.get("NOME", ""),
+        "e-mail": "",
+        "admissao": admissao,
+        "data de nascimento": str(r.get("DATA DE NASCIMENTO", "")).strip(),
+        "matricula": str(r.get("MATRICULA", "")).strip() if not pd.isna(r.get("MATRICULA")) else "",
+        "ramal": "",
+        "cpf": str(r.get("CPF", "")).strip(),
+        "telefone": tel_val,
+        "residencial": "",
+        "celular": cel_val,
+        "unidade": unidade,
+        "departamento": departamento,
+        "subunidade": subunidade,
+        "cargo": padronizar_cargo(r.get("CARGO", "")),
+        "email superior": str(r.get("E-MAIL DO SUPERIOR", "")).strip() if not pd.isna(r.get("E-MAIL DO SUPERIOR")) else "",
+        "email assessor": "",
+        "sexo": str(r.get("SEXO", "")).strip(),
+        "estado civil": normalizar_estado_civil(r.get("ESTADO CIVIL", "")),
+        "naturalidade": "",
+        "tem filhos": "",
+        "numero filhos": "",
+        "fuma": "",
+        "camiseta": "",
+        "calcado": "",
+        "email secundario": str(r.get("E-MAIL PARTICULAR", "")).strip() if not pd.isna(r.get("E-MAIL PARTICULAR")) else "",
+        "cep": str(r.get("CEP", "")).strip(),
+        "endereco": str(r.get("ENDEREÇO", "")).strip() if not pd.isna(r.get("ENDEREÇO")) else "",
+        "bairro": str(r.get("BAIRRO", "")).strip(),
+        "complemento": "",
+        "cidade": str(r.get("CIDADE", "")).strip(),
+        "uf": str(r.get("UF", "")).strip(),
+        "contato emergencia": "",
+        "telefone emergencia": "",
+        "contato emergencia secundario": "",
+        "telefone emergencia alternativo": "",
+        "peso": "",
+        "altura": "",
+        "grupo sanguineo": "",
+        "cnpj": "",
+        "inativo": "",
+        "codigo externo 1": str(r.get("MATRICULA (ESOCIAL)", "")).strip(),
+        "codigo externo 2": "",
+        "codigo externo 3": "",
+        "desligamento": "",
+        "motivo de desligamento": "",
+    }
+
+
+def _imprimir_relatorio(df_filtrado, out_path):
+    total = len(df_filtrado)
+    cargos_encontrados = []
+    for cargo_ref in CARGOS_ESPECIFICOS:
+        mask = df_filtrado["CARGO"].fillna("").str.upper().str.startswith(cargo_ref.upper())
+        nomes = df_filtrado.loc[mask, "NOME"].tolist()
+        if nomes:
+            cargos_encontrados.append((cargo_ref, nomes))
+
+    total_especificos = sum(len(n) for _, n in cargos_encontrados)
+    mask_sem_email = df_filtrado["E-MAIL DO SUPERIOR"].isna() | (df_filtrado["E-MAIL DO SUPERIOR"].str.strip() == "")
+    nomes_sem_email = df_filtrado.loc[mask_sem_email, "NOME"].tolist()
+    total_cadastrados = total - total_especificos
+
+    print("")
+    print(f"Arquivo gerado: {out_path}")
+    print("─" * 55)
+    print(f"Total de funcionarios: {total}")
+    if cargos_encontrados:
+        for cargo_ref, nomes in cargos_encontrados:
+            for nome in nomes:
+                print(f"Funcionarios em cargos especificos: {len(nomes)} - {nome} ({cargo_ref})")
+    else:
+        print("Funcionarios em cargos especificos: 0")
+    if nomes_sem_email:
+        for nome in nomes_sem_email:
+            print(f"Funcionarios sem e-mail de superior cadastrado: {len(nomes_sem_email)} - {nome}")
+    else:
+        print("Funcionarios sem e-mail de superior cadastrado: 0")
+    print(f"Total de funcionarios cadastrados: {total_cadastrados}")
+    print("─" * 55)
+
+
 def processar(xls_path, data_alvo=None):
     with arquivo_local_seguro(xls_path) as caminho_seguro:
         return _processar_interno(caminho_seguro, data_alvo)
@@ -357,16 +489,12 @@ def _processar_interno(xls_path, data_alvo=None):
         for enc in ("latin1", "utf-8", "utf-8-sig"):
             try:
                 df = pd.read_csv(xls_path, dtype=str, encoding=enc, sep=None, engine="python")
-                print(f"Lido como CSV (encoding={enc})") # Checagem de leitura
+                print(f"Lido como CSV (encoding={enc})")
                 break
             except Exception:
                 continue
         if df is None:
             raise ValueError("Nao foi possivel ler o arquivo CSV.")
-    elif ext == ".XLS":
-        print(f"Convertendo {xls_path} para xlsx...")
-        xlsx_path = converter_xls_para_xlsx(xls_path)
-        df = pd.read_excel(xlsx_path, header=0, dtype=str)
     else:
         df = pd.read_excel(xls_path, header=0, dtype=str)
 
@@ -390,127 +518,22 @@ def _processar_interno(xls_path, data_alvo=None):
         return None
 
     # Monta o CSV de saída
-    rows = []
-    for _, r in df_filtrado.iterrows():
-        unidade = montar_unidade(r.get("FILIAL"), r.get("LOCAL"))
-        departamento = normalizar_depto(r.get("CENTRO DE CUSTO"))
-        subunidade = normalizar_subunidade(r.get("LOCAL", ""))
-        telefone = limpar_telefone(r.get("CELULAR"))
-
-        row = {
-            "nome": r.get("NOME", ""),
-            "e-mail": "",
-            "admissao": alvo.strftime("%d/%m/%Y"),
-            "data de nascimento": str(r.get("DATA DE NASCIMENTO", "")).strip(),
-            "matricula": str(r.get("MATRICULA", "")).strip() if not pd.isna(r.get("MATRICULA")) else "",
-            "ramal": "",
-            "cpf": str(r.get("CPF", "")).strip(),
-            "telefone": telefone,
-            "residencial": "",
-            "celular": "",
-            "unidade": unidade,
-            "departamento": departamento,
-            "subunidade": subunidade,
-            "cargo": padronizar_cargo(r.get("CARGO", "")),
-            "email superior": str(r.get("E-MAIL DO SUPERIOR", "")).strip() if not pd.isna(r.get("E-MAIL DO SUPERIOR")) else "",
-            "email assessor": "",
-            "sexo": str(r.get("SEXO", "")).strip(),
-            "estado civil": str(r.get("ESTADO CIVIL", "")).strip(),
-            "naturalidade": "",
-            "tem filhos": "",
-            "numero filhos": "",
-            "fuma": "",
-            "camiseta": "",
-            "calcado": "",
-            "email secundario": str(r.get("E-MAIL PARTICULAR", "")).strip() if not pd.isna(r.get("E-MAIL PARTICULAR")) else "",
-            "cep": str(r.get("CEP", "")).strip(),
-            "endereco": str(r.get("ENDEREÇO", "")).strip() if not pd.isna(r.get("ENDEREÇO")) else "",
-            "bairro": str(r.get("BAIRRO", "")).strip(),
-            "complemento": "",
-            "cidade": str(r.get("CIDADE", "")).strip(),
-            "uf": str(r.get("UF", "")).strip(),
-            "contato emergencia": "",
-            "telefone emergencia": "",
-            "contato emergencia secundario": "",
-            "telefone emergencia alternativo": "",
-            "peso": "",
-            "altura": "",
-            "grupo sanguineo": "",
-            "cnpj": "",
-            "inativo": "",
-            "codigo externo 1": str(r.get("MATRICULA (ESOCIAL)", "")).strip(),
-            "codigo externo 2": "",
-            "codigo externo 3": "",
-            "desligamento": "",
-            "motivo de desligamento": "",
-        }
-        rows.append(row)
-
-    df_out = pd.DataFrame(rows)
-
-    # Remove pontuações de todas as colunas de texto do output
-    import re
-    def remover_pontuacao(val):
-        if isinstance(val, str):
-            return re.sub(r"[^\w\s@.\-/()\u00C0-\u00FF]", "", val)
-        return val
-    df_out = df_out.map(remover_pontuacao)
+    rows = [_montar_linha_dict(r, alvo.strftime("%d/%m/%Y"), modo_uap=False) for _, r in df_filtrado.iterrows()]
+    df_out = pd.DataFrame(rows).map(remover_pontuacao)
 
     # Nome do arquivo de saída com a data
     data_str = alvo.strftime("%d%m%Y")
     data_pasta = alvo.strftime("%d-%m")
     base_dir = os.path.dirname(os.path.abspath(xls_path))
     # Se o arquivo vem de pasta somente leitura ou servidor remoto, salva localmente
-    if base_dir.startswith("/mnt/user-data/uploads") or base_dir.startswith("\\\\"):
-        base_dir = "C:\\Users\\Pedro Lima\\Documents\\IMPORT_COLABORADORES"
+    if base_dir.startswith("/mnt/user-data/uploads") or base_dir.startswith("\\\\") or base_dir.startswith("//"):
+        base_dir = _obter_dir_base()
     out_dir = os.path.join(base_dir, data_pasta)
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, f"importar-usuarios-{data_str}.csv")
     df_out.to_csv(out_path, index=False, encoding="latin1")
 
-    # ─── Relatório de verificação ────────────────────────────────────────────
-    CARGOS_ESPECIFICOS = [
-        "AUXILIAR DE OFICINA", "MECANICO", "MOTORISTA", "PINTOR",
-        "ALINHADOR DE VEICULOS", "AUXILIAR DE PINTOR", "COPEIRA",
-        "LAVADOR", "PORTEIRO", "VIGIA", "SERVICOS GERAIS",
-    ]
-
-    total = len(df_filtrado)
-
-    # Cargos específicos — lista cada cargo encontrado e seus funcionários
-    cargos_encontrados = []
-    for cargo_ref in CARGOS_ESPECIFICOS:
-        mask = df_filtrado["CARGO"].fillna("").str.upper().str.startswith(cargo_ref.upper())
-        nomes = df_filtrado.loc[mask, "NOME"].tolist()
-        if nomes:
-            cargos_encontrados.append((cargo_ref, nomes))
-
-    total_especificos = sum(len(n) for _, n in cargos_encontrados)
-
-    # Sem e-mail do superior
-    mask_sem_email = df_filtrado["E-MAIL DO SUPERIOR"].isna() | (df_filtrado["E-MAIL DO SUPERIOR"].str.strip() == "")
-    nomes_sem_email = df_filtrado.loc[mask_sem_email, "NOME"].tolist()
-
-    total_cadastrados = total - total_especificos
-
-    print(f"")
-    print(f"Arquivo gerado: {out_path}")
-    print(f"─" * 55)
-    print(f"Total de funcionarios: {total}")
-    if cargos_encontrados:
-        for cargo_ref, nomes in cargos_encontrados:
-            for nome in nomes:
-                print(f"Funcionarios em cargos especificos: {len(nomes)} - {nome} ({cargo_ref})")
-    else:
-        print(f"Funcionarios em cargos especificos: 0")
-    if nomes_sem_email:
-        for nome in nomes_sem_email:
-            print(f"Funcionarios sem e-mail de superior cadastrado: {len(nomes_sem_email)} - {nome}")
-    else:
-        print(f"Funcionarios sem e-mail de superior cadastrado: 0")
-    print(f"Total de funcionarios cadastrados: {total_cadastrados}")
-    print(f"─" * 55)
-
+    _imprimir_relatorio(df_filtrado, out_path)
     return out_path
 
 
@@ -520,13 +543,16 @@ FILIAIS_UAP = {
 }
 
 
-def processar_uap(xls_path, data_pasta="16-04"):
-    """Gera importacao exclusiva das filiais UAP, sem filtro de data de admissao."""
+def processar_uap(xls_path):
+    """Gera importacao completa de TODOS os colaboradores do FPRE111,
+    sem filtro de data de admissao nem de filial.
+    Formato de saida compativel com import CSV da Intranet.
+    """
     with arquivo_local_seguro(xls_path) as caminho_seguro:
-        return _processar_uap_interno(caminho_seguro, data_pasta)
+        return _processar_uap_interno(caminho_seguro)
 
 
-def _processar_uap_interno(xls_path, data_pasta="16-04"):
+def _processar_uap_interno(xls_path):
     """Logica interna — sempre recebe caminho local seguro."""
     ext = os.path.splitext(xls_path)[1].upper()
 
@@ -541,141 +567,37 @@ def _processar_uap_interno(xls_path, data_pasta="16-04"):
                 continue
         if df is None:
             raise ValueError("Nao foi possivel ler o arquivo CSV.")
-    elif ext == ".XLS":
-        print(f"Convertendo {xls_path} para xlsx...")
-        xlsx_path = converter_xls_para_xlsx(xls_path)
-        df = pd.read_excel(xlsx_path, header=0, dtype=str)
     else:
         df = pd.read_excel(xls_path, header=0, dtype=str)
 
     df.columns = df.columns.str.strip()
 
-    # Filtra apenas as filiais UAP (sem filtro de data)
-    df_filtrado = df[df["FILIAL"].str.strip().isin(FILIAIS_UAP)].copy()
-    print(f"Funcionarios das filiais UAP encontrados: {len(df_filtrado)}")
+    # Import Completo: usa TODOS os colaboradores (sem filtro de filial nem data)
+    df_filtrado = df.copy()
+    print(f"Total de colaboradores encontrados no arquivo: {len(df_filtrado)}")
 
     if df_filtrado.empty:
-        print("Nenhum funcionario UAP encontrado.")
+        print("Nenhum colaborador encontrado no arquivo.")
         return None
 
-    # Monta o CSV de saída
-    rows = []
-    for _, r in df_filtrado.iterrows():
-        unidade = montar_unidade(r.get("FILIAL"), r.get("LOCAL"))
-        departamento = normalizar_depto(r.get("CENTRO DE CUSTO"))
-        subunidade = normalizar_subunidade(r.get("LOCAL", ""))
-        telefone = limpar_telefone(r.get("CELULAR"))
-        admissao = str(r.get("DATA DE ADMISSÃO", "")).strip()
+    # Monta o CSV de saída (modo_uap=True coloca telefone no campo celular)
+    rows = [_montar_linha_dict(r, str(r.get("DATA DE ADMISSÃO", "")).strip(), modo_uap=True) for _, r in df_filtrado.iterrows()]
+    df_out = pd.DataFrame(rows).map(remover_pontuacao)
 
-        row = {
-            "nome": r.get("NOME", ""),
-            "e-mail": "",
-            "admissao": admissao,
-            "data de nascimento": str(r.get("DATA DE NASCIMENTO", "")).strip(),
-            "matricula": str(r.get("MATRICULA", "")).strip() if not pd.isna(r.get("MATRICULA")) else "",
-            "ramal": "",
-            "cpf": str(r.get("CPF", "")).strip(),
-            "telefone": "",
-            "residencial": "",
-            "celular": telefone,
-            "unidade": unidade,
-            "departamento": departamento,
-            "subunidade": subunidade,
-            "cargo": padronizar_cargo(r.get("CARGO", "")),
-            "email superior": str(r.get("E-MAIL DO SUPERIOR", "")).strip() if not pd.isna(r.get("E-MAIL DO SUPERIOR")) else "",
-            "email assessor": "",
-            "sexo": str(r.get("SEXO", "")).strip(),
-            "estado civil": str(r.get("ESTADO CIVIL", "")).strip(),
-            "naturalidade": "",
-            "tem filhos": "",
-            "numero filhos": "",
-            "fuma": "",
-            "camiseta": "",
-            "calcado": "",
-            "email secundario": str(r.get("E-MAIL PARTICULAR", "")).strip() if not pd.isna(r.get("E-MAIL PARTICULAR")) else "",
-            "cep": str(r.get("CEP", "")).strip(),
-            "endereco": str(r.get("ENDEREÇO", "")).strip() if not pd.isna(r.get("ENDEREÇO")) else "",
-            "bairro": str(r.get("BAIRRO", "")).strip(),
-            "complemento": "",
-            "cidade": str(r.get("CIDADE", "")).strip(),
-            "uf": str(r.get("UF", "")).strip(),
-            "contato emergencia": "",
-            "telefone emergencia": "",
-            "contato emergencia secundario": "",
-            "telefone emergencia alternativo": "",
-            "peso": "",
-            "altura": "",
-            "grupo sanguineo": "",
-            "cnpj": "",
-            "inativo": "",
-            "codigo externo 1": str(r.get("MATRICULA (ESOCIAL)", "")).strip(),
-            "codigo externo 2": "",
-            "codigo externo 3": "",
-            "desligamento": "",
-            "motivo de desligamento": "",
-        }
-        rows.append(row)
-
-    df_out = pd.DataFrame(rows)
-
-    # Remove pontuações
-    import re
-    def remover_pontuacao(val):
-        if isinstance(val, str):
-            return re.sub(r"[^\w\s@.\-/()\u00C0-\u00FF]", "", val)
-        return val
-    df_out = df_out.map(remover_pontuacao)
-
-    # Salva na pasta fixa 16-04
+    # Salva com nome baseado na data atual
+    agora = datetime.now()
+    data_str = agora.strftime("%d%m%Y")
+    data_pasta = agora.strftime("%d-%m")
     base_dir = os.path.dirname(os.path.abspath(xls_path))
     # Se o arquivo vem de pasta somente leitura ou servidor remoto, salva localmente
-    if base_dir.startswith("/mnt/user-data/uploads") or base_dir.startswith("\\\\"):
-        base_dir = "C:\\Users\\Pedro Lima\\Documents\\IMPORT_COLABORADORES"
+    if base_dir.startswith("/mnt/user-data/uploads") or base_dir.startswith("\\\\") or base_dir.startswith("//"):
+        base_dir = _obter_dir_base()
     out_dir = os.path.join(base_dir, data_pasta)
     os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, "import_usuarios_uap16042026.csv")
+    out_path = os.path.join(out_dir, f"import-completo-{data_str}.csv")
     df_out.to_csv(out_path, index=False, encoding="latin1")
 
-    # ─── Relatório ───────────────────────────────────────────────────────────
-    CARGOS_ESPECIFICOS = [
-        "AUXILIAR DE OFICINA", "MECANICO", "MOTORISTA", "PINTOR",
-        "ALINHADOR DE VEICULOS", "AUXILIAR DE PINTOR", "COPEIRA",
-        "LAVADOR", "PORTEIRO", "VIGIA", "SERVICOS GERAIS",
-    ]
-
-    total = len(df_filtrado)
-    cargos_encontrados = []
-    for cargo_ref in CARGOS_ESPECIFICOS:
-        mask = df_filtrado["CARGO"].fillna("").str.upper().str.startswith(cargo_ref.upper())
-        nomes = df_filtrado.loc[mask, "NOME"].tolist()
-        if nomes:
-            cargos_encontrados.append((cargo_ref, nomes))
-
-    total_especificos = sum(len(n) for _, n in cargos_encontrados)
-
-    mask_sem_email = df_filtrado["E-MAIL DO SUPERIOR"].isna() | (df_filtrado["E-MAIL DO SUPERIOR"].str.strip() == "")
-    nomes_sem_email = df_filtrado.loc[mask_sem_email, "NOME"].tolist()
-
-    total_cadastrados = total - total_especificos
-
-    print(f"")
-    print(f"Arquivo gerado: {out_path}")
-    print(f"─" * 55)
-    print(f"Total de funcionarios: {total}")
-    if cargos_encontrados:
-        for cargo_ref, nomes in cargos_encontrados:
-            for nome in nomes:
-                print(f"Funcionarios em cargos especificos: {len(nomes)} - {nome} ({cargo_ref})")
-    else:
-        print(f"Funcionarios em cargos especificos: 0")
-    if nomes_sem_email:
-        for nome in nomes_sem_email:
-            print(f"Funcionarios sem e-mail de superior cadastrado: {len(nomes_sem_email)} - {nome}")
-    else:
-        print(f"Funcionarios sem e-mail de superior cadastrado: 0")
-    print(f"Total de funcionarios cadastrados: {total_cadastrados}")
-    print(f"─" * 55)
-
+    _imprimir_relatorio(df_filtrado, out_path)
     return out_path
 
 
@@ -683,13 +605,12 @@ if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Uso:")
         print("  python gerar_importar_usuarios.py <arquivo> [dd/mm/aaaa]         # importacao semanal normal")
-        print("  python gerar_importar_usuarios.py <arquivo> --uap [pasta]        # importacao filiais UAP")
+        print("  python gerar_importar_usuarios.py <arquivo> --uap               # import completo (todos os colaboradores)")
         sys.exit(1)
 
     xls_path = sys.argv[1]
     if len(sys.argv) > 2 and sys.argv[2] == "--uap":
-        pasta = sys.argv[3] if len(sys.argv) > 3 else "16-04"
-        processar_uap(xls_path, pasta)
+        processar_uap(xls_path)
     else:
         data_alvo = sys.argv[2] if len(sys.argv) > 2 else None
         processar(xls_path, data_alvo)

@@ -113,15 +113,35 @@ Antes de efetuar o provisionamento no AD ou na Intranet, o Analista Júnior deve
 
 ---
 
+## 📦 Como Gerar o Executável (.exe) & Publicação
+
+O sistema pode ser compilado em um arquivo executável para rodar em computadores dos operadores sem necessidade de ter Python instalado:
+
+- **Modo Arquivo Único (`GERAR_EXE_UNICO.bat`):** Gera um único executável `dist/ImportarUsuariosUmuarama.exe` portátil com todas as dependências e `ou_map.json` embutidos.
+- **Modo Pasta (`GERAR_EXE_PASTA.bat`):** Gera uma pasta `dist/ImportarUsuariosUmuarama/` contendo o executável e o arquivo `ou_map.json` externo editável.
+
+### 🔄 Controle de Versão & Atualização do `.exe` no Portal
+
+> ⚠️ **IMPORTANTE:**
+> 1. Alterações feitas nos arquivos de código-fonte (`.py`) **não atualizam automaticamente o `.exe`**. O executável é um arquivo binário compilado que "congela" o código no momento do build.
+> 2. Sempre que você alterar e testar o código na VM (em `C:\apps\IMPORT_COLABORADORES\`), execute o arquivo **`GERAR_EXE_UNICO.bat`**.
+> 3. **Deploy automático:** O script `GERAR_EXE_UNICO.bat` já está configurado para, ao final da compilação, copiar automaticamente a nova versão para a pasta `C:\apps\portal\downloads\ImportarUsuariosUmuarama.exe`.
+> 4. Assim que a compilação finalizar, os operadores que baixarem o `.exe` através do **Portal de Serviços TI** (`http://10.56.24.17:9090`) já receberão a versão atualizada.
+
+---
+
 ## 📁 Estrutura do Projeto
 
 ```text
 IMPORT_COLABORADORES/
 ├── EXECUTAR_IMPORT_COMPLETO.bat   # Script principal de execução diária (Workflow completo)
 ├── CADASTRAR_CREDENCIAIS.bat      # Utilitário para salvar acesso ao servidor no Windows
+├── GERAR_EXE_PASTA.bat            # Gera o executável em modo pasta (--onedir)
+├── GERAR_EXE_UNICO.bat            # Gera o executável em arquivo único (--onefile)
 ├── ExecutarImportAD.bat           # Atalho para inicializar apenas a GUI do AD
 ├── gerar_importar_usuarios_uap.py # Engine Python de ETL, limpeza e padronização do FPRE111
 ├── ImportarUsuariosUmuarama.py     # Interface Tkinter + Script de provisionamento no AD via PowerShell
+├── ou_map.json                     # Mapeamento dinâmico de OUs do Active Directory
 ├── .gitignore                      # Filtro de segurança contra vazamento de dados no Git
 └── README.md                       # Guia de documentação do sistema
 ```

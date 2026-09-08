@@ -38,3 +38,8 @@ umu_env.tmp
 .idea/
 .DS_Store
 Thumbs.db
+
+# PyInstaller builds
+build/
+dist/
+*.spec
