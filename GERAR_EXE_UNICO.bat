@@ -73,8 +73,14 @@ if exist "ou_map.json" (
 if exist "..\portal\downloads" (
     copy /y "dist\ImportarUsuariosUmuarama.exe" "..\portal\downloads\ImportarUsuariosUmuarama.exe" >nul 2>&1
     copy /y "ou_map.json" "..\portal\downloads\ou_map.json" >nul 2>&1
-    echo [5/5] Atualizado automaticamente no Portal de Servicos (portal\downloads\).
+    echo [5/5] Atualizado automaticamente no Portal de Servicos local (portal\downloads\).
 )
+if exist "\\10.56.24.17\apps\portal\downloads" (
+    copy /y "dist\ImportarUsuariosUmuarama.exe" "\\10.56.24.17\apps\portal\downloads\ImportarUsuariosUmuarama.exe" >nul 2>&1
+    copy /y "ou_map.json" "\\10.56.24.17\apps\portal\downloads\ou_map.json" >nul 2>&1
+    echo [5/5] Atualizado automaticamente no Portal de Servicos da Rede (\\10.56.24.17\apps\portal\downloads\).
+)
+
 
 echo.
 echo ============================================================
