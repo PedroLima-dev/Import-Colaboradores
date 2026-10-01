@@ -8,7 +8,7 @@ Modos de uso:
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
-import subprocess, threading, sys, os, csv, io, tempfile, unicodedata, chardet, argparse, json, re
+import subprocess, threading, sys, os, csv, io, tempfile, unicodedata, chardet, argparse, json, re, datetime
 
 # ── Resolucao de caminhos compativel com PyInstaller / Script ─────────────────
 def obter_diretorio_base():
@@ -60,7 +60,7 @@ DC_DEFAULT_LABEL = "umuarama.local"
 BASE = "OU=GRUPO UMUARAMA,DC=umuarama,DC=local"
 CONC = f"OU=CONCESSIONARIAS,{BASE}"
 
-OU_MAP = {
+OU_MAP_FALLBACK = {
     ("TOYOTA", "ARAGUAINA"):    f"OU=ARAGUAINA,OU=TOYOTA,{CONC}",
     ("TOYOTA", "BACABAL"):      f"OU=BACABAL,OU=TOYOTA,{CONC}",
     ("TOYOTA", "BALSAS"):       f"OU=BALSAS,OU=TOYOTA,{CONC}",
@@ -159,19 +159,19 @@ OU_MAP = {
 # ── Carregamento dinamico de OUs via JSON externo ─────────────────────────────
 def carregar_ou_map():
     """Carrega mapeamento de OUs do arquivo JSON externo.
-    Se o JSON nao existir, retorna o dicionario hardcoded OU_MAP acima.
+    Se o JSON nao existir, retorna o dicionario hardcoded OU_MAP_FALLBACK acima.
     """
     caminho_json = obter_caminho_ou_map()
     if not os.path.exists(caminho_json):
         print(f"[OU-MAP] Arquivo {caminho_json} nao encontrado, usando mapeamento hardcoded.")
-        return dict(OU_MAP)  # copia do hardcoded
+        return dict(OU_MAP_FALLBACK)  # copia do fallback
 
     try:
         with open(caminho_json, "r", encoding="utf-8") as f:
             cfg = json.load(f)
     except Exception as e:
         print(f"[OU-MAP] Erro ao ler {caminho_json}: {e}  — usando mapeamento hardcoded.")
-        return dict(OU_MAP)
+        return dict(OU_MAP_FALLBACK)
 
     mapa = {}
 
@@ -254,13 +254,12 @@ ALIAS_MARCA = {
     "VOLKS": "VOLKSWAGEN", "VW": "VOLKSWAGEN",
     "HARLEY-DAVIDSON": "HARLEY", "HD": "HARLEY",
     "CITROEN": "CITROEN-PEUGEOT", "PEUGEOT": "CITROEN-PEUGEOT",
-    "CORRETORA": "CORRETORA DE SEGUROS", "CORRETORA DE SEGUROS": "CORRETORA DE SEGUROS",
+    "CORRETORA": "CORRETORA DE SEGUROS",
     "JEEP": "JEEP E RAM", "RAM": "JEEP E RAM",
 }
 
 ALIAS_CIDADE = {
     "MINEIRO":  "MINEIROS",
-    "URUACU":   "URUACU",
     "URUAÇU":   "URUACU",
 }
 
@@ -445,6 +444,10 @@ def parse_csv_admissoes(path):
 # Gera PowerShell inline
 # ──────────────────────────────────────────────────────────────────────────────
 def gerar_ps1(usuarios, servidor_dc, forcar_troca):
+    """Gera script PowerShell de importacao em lote.
+    Agora inclui checagem por CPF (atributo description) ANTES de criar,
+    para tratar readmissoes de colaboradores com a mesma conta inativa no AD.
+    """
     linhas = ""
     for u in usuarios:
         nome_esc = u["nome"].replace('"', "'")
@@ -495,6 +498,54 @@ function Get-UsuarioAD([string]$sam) {{
     }}
     return $null
 }}
+
+# Busca usuario no AD pelo CPF (atributo description) — para detectar readmissao
+function Get-UsuarioPorCPF([string]$cpf) {{
+    if (-not $cpf) {{ return $null }}
+    $cpf_limpo = $cpf -replace '[^0-9]', ''
+    if (-not $cpf_limpo) {{ return $null }}
+    $cpf_com_zeros = if ($cpf_limpo.Length -lt 11) {{ $cpf_limpo.PadLeft(11, '0') }} else {{ $cpf_limpo }}
+    $ldap = if ($ServidorDC) {{ "LDAP://$ServidorDC/$BaseDN" }} else {{ "LDAP://$BaseDN" }}
+    $e = New-Object System.DirectoryServices.DirectoryEntry($ldap, $credUser, $credSenha)
+    $s = New-Object System.DirectoryServices.DirectorySearcher($e)
+    # Busca tanto CPF com mascara quanto so digitos e com zeros a esquerda
+    $s.Filter = "(&(objectCategory=person)(objectClass=user)(|(description=$cpf)(description=$cpf_limpo)(description=$cpf_com_zeros)(description=*$cpf_limpo*)))"
+    $s.SearchScope = "Subtree"
+    $res = $s.FindOne()
+    if ($res -ne $null) {{
+        $entry = $res.GetDirectoryEntry()
+        $dispName = $entry.Properties["displayName"].Value
+        if ($dispName -eq $null) {{ $dispName = $entry.Properties["cn"].Value }}
+        if ($dispName -eq $null) {{ $dispName = "" }}
+        $uac = $entry.Properties["userAccountControl"].Value
+        if ($uac -eq $null) {{ $uac = 0 }}
+        $sam = $entry.Properties["sAMAccountName"].Value
+        $dn  = $entry.Properties["distinguishedName"].Value
+        return [PSCustomObject]@{{
+            Exists      = $true
+            DisplayName = [string]$dispName
+            SAM         = [string]$sam
+            UAC         = [int]$uac
+            DN          = [string]$dn
+            Path        = [string]$entry.Path
+        }}
+    }}
+    return $null
+}}
+
+function Mover-UsuarioOU([System.DirectoryServices.DirectoryEntry]$userEntry, [string]$ouAlvo) {{
+    try {{
+        $ouEntry = New-Entry $ouAlvo
+        if (-not $ouEntry.Guid) {{ throw "OU de destino nao encontrada: $ouAlvo" }}
+        $userEntry.MoveTo($ouEntry)
+        $ouEntry.Dispose()
+        return $true
+    }} catch {{
+        Write-Output "AVISO_MOVE|$($_.Exception.Message)"
+        return $false
+    }}
+}}
+
 $usuarios = @(
 {linhas}
 )
@@ -505,16 +556,17 @@ foreach ($u in $usuarios) {{
     $SenhaPadrao = "@" + $primeiroNome.Substring(0,1).ToUpper() + $primeiroNome.Substring(1).ToLower() + "2026"
     Write-Output "INICIO|$sam|$nomeCompleto"
     try {{
+        # ── Etapa 1: busca pelo login (sAMAccountName) ──────────────────
         $existe = Get-UsuarioAD $sam
         if ($existe -ne $null) {{
             $uac = $existe.UAC
             $is_disabled = (($uac -band 2) -eq 2)
             $existing_name = $existe.DisplayName
-            
+
             $existing_norm = ($existing_name -replace '\\s+', ' ').Trim()
             $import_norm = ($nomeCompleto -replace '\\s+', ' ').Trim()
             $match_nome = ($existing_norm -ieq $import_norm)
-            
+
             if ($match_nome) {{
                 if (-not $is_disabled) {{
                     Write-Output "RESULTADO|$sam|OK_EXISTE_ATIVO|$($existe.DN)"
@@ -543,6 +595,82 @@ foreach ($u in $usuarios) {{
                 continue
             }}
         }}
+
+        # ── Etapa 2: busca pelo CPF para detectar readmissao ────────────
+        $porCPF = Get-UsuarioPorCPF $u.CPF
+        if ($porCPF -ne $null) {{
+            $uac_cpf = $porCPF.UAC
+            $is_disabled_cpf = (($uac_cpf -band 2) -eq 2)
+            if ($is_disabled_cpf) {{
+                # Readmissao confirmada: reativa, move OU se necessario, reseta senha
+                try {{
+                    $userEntry = New-Object System.DirectoryServices.DirectoryEntry($porCPF.Path, $credUser, $credSenha)
+
+                    # Move para nova OU se o DN da OU atual for diferente do alvo
+                    $ouAtualDN = $porCPF.DN -replace '^CN=[^,]+,\\s*', ''
+                    if ($ouAtualDN -ine $u.OU) {{
+                        Mover-UsuarioOU $userEntry $u.OU | Out-Null
+                        # Recarrega a entrada apos mover
+                        $userEntry.Dispose()
+                        $pesquisa2 = Get-UsuarioPorCPF $u.CPF
+                        if ($pesquisa2 -ne $null) {{
+                            $userEntry = New-Object System.DirectoryServices.DirectoryEntry($pesquisa2.Path, $credUser, $credSenha)
+                        }}
+                    }}
+
+                    # Atualiza login, email e nome
+                    $userEntry.Properties["sAMAccountName"].Value    = $sam
+                    $userEntry.Properties["userPrincipalName"].Value = $u.Email
+                    $userEntry.Properties["givenName"].Value         = $u.Nome
+                    $userEntry.Properties["sn"].Value                = $u.Sobrenome
+                    $userEntry.Properties["displayName"].Value       = $nomeCompleto
+                    $userEntry.Properties["mail"].Value              = $u.Email
+
+                    # Reativa e reseta senha
+                    $currUac = [int]$userEntry.Properties["userAccountControl"].Value
+                    $newUac = ($currUac -band -bnot 2) -bor 512
+                    $userEntry.Properties["userAccountControl"].Value = $newUac
+                    $userEntry.CommitChanges()
+                    $userEntry.Invoke("SetPassword", $SenhaPadrao)
+                    if ($ForcarTroca) {{ $userEntry.Properties["pwdLastSet"].Value = 0 }}
+                    $userEntry.CommitChanges()
+
+                    $userDN = $userEntry.Properties["distinguishedName"].Value
+                    $userEntry.Dispose()
+
+                    # VPN se elegivel
+                    if ($u.VPN) {{
+                        try {{
+                            $grupoDN = "CN=UsuariosVPN,OU=OpenVPN,DC=umuarama,DC=local"
+                            $ldapGrupo = if ($ServidorDC) {{ "LDAP://$ServidorDC/$grupoDN" }} else {{ "LDAP://$grupoDN" }}
+                            $grupoEntry = New-Object System.DirectoryServices.DirectoryEntry($ldapGrupo, $credUser, $credSenha)
+                            if (-not $grupoEntry.Guid) {{ throw "Grupo VPN nao encontrado" }}
+                            if (-not $grupoEntry.Properties["member"].Contains($userDN)) {{
+                                $grupoEntry.Properties["member"].Add($userDN) | Out-Null
+                                $grupoEntry.CommitChanges()
+                            }}
+                            $grupoEntry.Dispose()
+                            Write-Output "VPN_OK|$sam"
+                        }} catch {{
+                            Write-Output "VPN_ERRO|$sam|$($_.Exception.Message)"
+                        }}
+                    }}
+
+                    Write-Output "RESULTADO|$sam|OK_READMITIDO|$userDN"
+                    continue
+                }} catch {{
+                    Write-Output "RESULTADO|$sam|ERRO|Falha na readmissao por CPF: $($_.Exception.Message)"
+                    continue
+                }}
+            }} else {{
+                # CPF encontrado em conta ATIVA com login diferente — apenas avisa
+                $clean_name = $porCPF.DisplayName -replace '\\|', ' '
+                Write-Output "RESULTADO|$sam|CONFLITO_CPF|$($porCPF.SAM)|$clean_name"
+                continue
+            }}
+        }}
+
+        # ── Etapa 3: criacao normal (usuario nao existe no AD) ───────────
         $entry = New-Entry $u.OU
         if (-not $entry.Guid) {{ throw "OU nao encontrada: $($u.OU)" }}
         $user = $entry.Children.Add("CN=$nomeCompleto", "user")
@@ -583,6 +711,219 @@ foreach ($u in $usuarios) {{
     }} catch {{
         Write-Output "RESULTADO|$sam|ERRO|$($_.Exception.Message)"
     }}
+}}
+Write-Output "FIM"
+"""
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Scripts PowerShell para a aba de Consulta & Gestao
+# ──────────────────────────────────────────────────────────────────────────────
+def gerar_ps1_consultar(termo, servidor_dc):
+    """Gera PS1 que busca um usuario no AD por CPF, Login ou Nome (parcial).
+    Emite: ENCONTRADO|sam|nome|email|cpf|uac|dn
+           NAO_ENCONTRADO
+           ERRO|mensagem
+    """
+    dc_p   = f'"{servidor_dc}"' if servidor_dc else '""'
+    termo_esc = termo.replace('"', "'")
+    return f"""
+$credUser   = $env:UMU_USER
+$credSenha  = $env:UMU_PASS
+$ServidorDC = {dc_p}
+$BaseDN     = "DC=umuarama,DC=local"
+$Termo      = "{termo_esc}"
+
+$ldap = if ($ServidorDC) {{ "LDAP://$ServidorDC/$BaseDN" }} else {{ "LDAP://$BaseDN" }}
+try {{
+    $root = New-Object System.DirectoryServices.DirectoryEntry($ldap, $credUser, $credSenha)
+    if (-not $root.Guid) {{ throw "Falha de autenticacao com o DC." }}
+    $s = New-Object System.DirectoryServices.DirectorySearcher($root)
+    $s.SearchScope = "Subtree"
+    $s.PageSize    = 50
+    $s.SizeLimit   = 50
+
+    function Escape-Ldap([string]$str) {{
+        if (-not $str) {{ return "" }}
+        return $str.Replace('\\', '\\5c').Replace('*', '\\2a').Replace('(', '\\28').Replace(')', '\\29').Replace("`0", '\\00')
+    }}
+
+    $termoLimpo = $Termo.Trim()
+    $termoLdap  = Escape-Ldap $termoLimpo
+    $termoDig   = $termoLimpo -replace '[^0-9]', ''
+
+    # Remove acentos para busca flexivel
+    $norm = $termoLimpo.Normalize([System.Text.NormalizationForm]::FormD)
+    $sb = New-Object System.Text.StringBuilder
+    foreach ($c in $norm.ToCharArray()) {{
+        if ([System.Globalization.CharUnicodeInfo]::GetUnicodeCategory($c) -ne [System.Globalization.UnicodeCategory]::NonSpacingMark) {{
+            [void]$sb.Append($c)
+        }}
+    }}
+    $termoSemAcento = $sb.ToString()
+    $termoSemAcentoLdap = Escape-Ldap $termoSemAcento
+
+    $clausulas = New-Object System.Collections.Generic.List[string]
+
+    # 1. Ambiguous Name Resolution (ANR)
+    if ($termoLdap) {{
+        $clausulas.Add("(anr=$termoLdap)")
+        if ($termoSemAcentoLdap -ne $termoLdap) {{
+            $clausulas.Add("(anr=$termoSemAcentoLdap)")
+        }}
+    }}
+
+    # 2. Login / sAMAccountName (exato e wildcard)
+    $clausulas.Add("(sAMAccountName=$termoLdap)")
+    $clausulas.Add("(sAMAccountName=*$termoLdap*)")
+    if ($termoSemAcentoLdap -ne $termoLdap) {{
+        $clausulas.Add("(sAMAccountName=*$termoSemAcentoLdap*)")
+    }}
+
+    # 3. Nome de exibicao, CN e Name
+    $clausulas.Add("(displayName=*$termoLdap*)")
+    $clausulas.Add("(cn=*$termoLdap*)")
+    $clausulas.Add("(name=*$termoLdap*)")
+    $clausulas.Add("(mail=*$termoLdap*)")
+    if ($termoSemAcentoLdap -ne $termoLdap) {{
+        $clausulas.Add("(displayName=*$termoSemAcentoLdap*)")
+        $clausulas.Add("(cn=*$termoSemAcentoLdap*)")
+        $clausulas.Add("(name=*$termoSemAcentoLdap*)")
+    }}
+
+    # 4. CPF / Description
+    $clausulas.Add("(description=*$termoLdap*)")
+    if ($termoDig.Length -ge 4) {{
+        $clausulas.Add("(description=*$termoDig*)")
+        if ($termoDig.Length -lt 11) {{
+            $comZeros = $termoDig.PadLeft(11, '0')
+            $clausulas.Add("(description=*$comZeros*)")
+        }}
+    }}
+
+    $orFilter = "(|" + ($clausulas -join "") + ")"
+    $s.Filter = "(&(objectCategory=person)(objectClass=user)$orFilter)"
+
+    $resultados = $s.FindAll()
+    if ($resultados.Count -eq 0) {{
+        Write-Output "NAO_ENCONTRADO"
+    }} else {{
+        $vistos = @{{}}
+        foreach ($res in $resultados) {{
+            $e   = $res.GetDirectoryEntry()
+            $sam = [string]$e.Properties["sAMAccountName"].Value
+            if (-not $sam) {{ continue }}
+            if ($vistos.ContainsKey($sam.ToLower())) {{ continue }}
+            $vistos[$sam.ToLower()] = $true
+
+            $dn   = [string]$e.Properties["distinguishedName"].Value
+            $disp = [string]$e.Properties["displayName"].Value
+            if (-not $disp) {{ $disp = [string]$e.Properties["cn"].Value }}
+            if (-not $disp) {{ $disp = [string]$e.Properties["name"].Value }}
+            $mail = [string]$e.Properties["mail"].Value
+            $cpf  = [string]$e.Properties["description"].Value
+            $uac  = $e.Properties["userAccountControl"].Value
+            if ($uac -eq $null) {{ $uac = 512 }}
+
+            # Escapa pipes
+            $disp = $disp -replace '\\|', ' '
+            $mail = $mail -replace '\\|', ' '
+            $cpf  = $cpf  -replace '\\|', ' '
+            $dn2  = $dn   -replace '\\|', '/'
+            Write-Output "ENCONTRADO|$sam|$disp|$mail|$cpf|$uac|$dn2"
+        }}
+    }}
+    $root.Dispose()
+}} catch {{
+    Write-Output "ERRO|$($_.Exception.Message)"
+}}
+Write-Output "FIM"
+"""
+
+
+def gerar_ps1_acao(acao, sam, servidor_dc, nova_senha="", forcar_troca=True, nova_ou=""):
+    """Gera PS1 para executar uma acao administrativa em uma conta existente.
+    acao: 'alterar_senha' | 'desativar' | 'reativar'
+    Emite: ACAO_OK|sam|detalhe
+           ACAO_ERRO|sam|mensagem
+    """
+    dc_p     = f'"{servidor_dc}"' if servidor_dc else '""'
+    sam_esc  = sam.replace('"', "'")
+    senha_esc = nova_senha.replace('"', "'")
+    troca    = "$true" if forcar_troca else "$false"
+    ou_esc   = nova_ou.replace('"', "'")
+    return f"""
+$credUser   = $env:UMU_USER
+$credSenha  = $env:UMU_PASS
+$ServidorDC = {dc_p}
+$BaseDN     = "DC=umuarama,DC=local"
+$SAM        = "{sam_esc}"
+$Acao       = "{acao}"
+$NovaSenha  = "{senha_esc}"
+$ForcarTroca = {troca}
+$NovaOU      = "{ou_esc}"
+
+function New-Entry([string]$path) {{
+    $escaped = $path -replace '/', '\\/'
+    if ($ServidorDC) {{ $p = "LDAP://$ServidorDC/$escaped" }} else {{ $p = "LDAP://$escaped" }}
+    return New-Object System.DirectoryServices.DirectoryEntry($p, $credUser, $credSenha)
+}}
+
+$ldap = if ($ServidorDC) {{ "LDAP://$ServidorDC/$BaseDN" }} else {{ "LDAP://$BaseDN" }}
+try {{
+    $root = New-Object System.DirectoryServices.DirectoryEntry($ldap, $credUser, $credSenha)
+    if (-not $root.Guid) {{ throw "Falha de autenticacao com o DC." }}
+    $s = New-Object System.DirectoryServices.DirectorySearcher($root)
+    $s.Filter = "(&(objectClass=user)(sAMAccountName=$SAM))"
+    $s.SearchScope = "Subtree"
+    $res = $s.FindOne()
+    if ($res -eq $null) {{ throw "Usuario '$SAM' nao encontrado no AD." }}
+    $u = $res.GetDirectoryEntry()
+
+    if ($Acao -eq "alterar_senha") {{
+        $u.Invoke("SetPassword", $NovaSenha)
+        if ($ForcarTroca) {{ $u.Properties["pwdLastSet"].Value = 0 }}
+        $u.CommitChanges()
+        Write-Output "ACAO_OK|$SAM|Senha alterada com sucesso."
+
+    }} elseif ($Acao -eq "desativar") {{
+        $currUac = [int]$u.Properties["userAccountControl"].Value
+        $newUac  = $currUac -bor 2
+        $u.Properties["userAccountControl"].Value = $newUac
+        $u.CommitChanges()
+        Write-Output "ACAO_OK|$SAM|Conta desativada."
+
+    }} elseif ($Acao -eq "reativar") {{
+        $currUac = [int]$u.Properties["userAccountControl"].Value
+        $newUac  = ($currUac -band -bnot 2) -bor 512
+        $u.Properties["userAccountControl"].Value = $newUac
+        if ($NovaSenha) {{
+            $u.Invoke("SetPassword", $NovaSenha)
+            if ($ForcarTroca) {{ $u.Properties["pwdLastSet"].Value = 0 }}
+        }}
+        $u.CommitChanges()
+
+        # Move para nova OU se informada
+        if ($NovaOU) {{
+            try {{
+                $ouEntry = New-Entry $NovaOU
+                if (-not $ouEntry.Guid) {{ throw "OU nao encontrada" }}
+                $u.MoveTo($ouEntry)
+                $ouEntry.Dispose()
+                Write-Output "ACAO_OK|$SAM|Conta reativada e movida para nova OU."
+            }} catch {{
+                Write-Output "ACAO_OK|$SAM|Conta reativada (falha ao mover OU: $($_.Exception.Message))."
+            }}
+        }} else {{
+            Write-Output "ACAO_OK|$SAM|Conta reativada com nova senha."
+        }}
+    }} else {{
+        throw "Acao desconhecida: $Acao"
+    }}
+    $u.Dispose()
+    $root.Dispose()
+}} catch {{
+    Write-Output "ACAO_ERRO|$SAM|$($_.Exception.Message)"
 }}
 Write-Output "FIM"
 """
@@ -666,7 +1007,8 @@ def modo_bat(args):
         proc = subprocess.Popen(
             ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", tmp.name],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            env=env, text=True, encoding="utf-8", errors="replace"
+            env=env, text=True, encoding="utf-8", errors="replace",
+            creationflags=subprocess.CREATE_NO_WINDOW
         )
         for linha in proc.stdout:
             linha = linha.rstrip()
@@ -749,10 +1091,261 @@ class _GuiStdout:
         pass
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Dialogo de Login — exibido antes da janela principal
+# ──────────────────────────────────────────────────────────────────────────────
+class DialogLogin(tk.Tk):
+    """Janela de login modal que valida as credenciais contra o AD via bind LDAP.
+    Atributos publicos apos sucesso:
+        self.usuario  — login informado (ex: umuarama\\admin)
+        self.senha    — senha validada (mantida apenas em memoria)
+        self.dc       — servidor DC resolvido
+    Encerra o processo se o login for cancelado ou falhar.
+    """
+
+    COR_BG   = "#1e1e2e"
+    COR_CARD = "#2a2a3e"
+    COR_ACC  = "#7c6af7"
+    COR_TXT  = "#cdd6f4"
+    COR_SUB  = "#6c7086"
+    COR_ERR  = "#f38ba8"
+
+    def __init__(self):
+        super().__init__()
+        self.title("Importar Usuarios AD - Autenticacao")
+        self.resizable(False, False)
+        self.configure(bg=self.COR_BG)
+        self._autenticado = False
+        self.usuario = ""
+        self.senha   = ""
+        self.dc      = ""
+        self._build()
+        # Centraliza na tela
+        self.update_idletasks()
+        larg, alt = 420, 420
+        x = (self.winfo_screenwidth()  - larg) // 2
+        y = (self.winfo_screenheight() - alt)  // 2
+        self.geometry(f"{larg}x{alt}+{x}+{y}")
+        self.protocol("WM_DELETE_WINDOW", self._cancelar)
+
+    def _build(self):
+        C = self  # alias para as cores
+        pad = dict(padx=32, pady=0)
+
+        tk.Label(self, text="🔐  Importar Usuarios AD",
+                 bg=C.COR_BG, fg=C.COR_ACC,
+                 font=("Segoe UI", 15, "bold")).pack(pady=(32, 4))
+        tk.Label(self, text="Grupo Umuarama  ·  Autenticação requerida",
+                 bg=C.COR_BG, fg=C.COR_SUB,
+                 font=("Segoe UI", 9)).pack(pady=(0, 20))
+
+        # Campos
+        tk.Label(self, text="Usuário AD  (ex: umuarama\\admin):",
+                 bg=C.COR_BG, fg=C.COR_TXT,
+                 font=("Segoe UI", 9), anchor="w").pack(fill="x", **pad)
+        self._var_user = tk.StringVar()
+        self._ent_user = tk.Entry(self, textvariable=self._var_user,
+                 bg=C.COR_CARD, fg=C.COR_TXT, insertbackground=C.COR_TXT,
+                 font=("Segoe UI", 11), relief="flat", bd=8)
+        self._ent_user.pack(fill="x", padx=32, pady=(2, 10))
+
+        tk.Label(self, text="Senha:",
+                 bg=C.COR_BG, fg=C.COR_TXT,
+                 font=("Segoe UI", 9), anchor="w").pack(fill="x", **pad)
+        self._var_pass = tk.StringVar()
+        self._ent_pass = tk.Entry(
+            self, textvariable=self._var_pass, show="*",
+            bg=C.COR_CARD, fg=C.COR_TXT, insertbackground=C.COR_TXT,
+            font=("Segoe UI", 11), relief="flat", bd=8)
+        self._ent_pass.pack(fill="x", padx=32, pady=(2, 4))
+
+        # Servidor DC
+        tk.Label(self, text=f"Servidor DC  (padrão: {DC_DEFAULT_LABEL}):",
+                 bg=C.COR_BG, fg=C.COR_TXT,
+                 font=("Segoe UI", 9), anchor="w").pack(fill="x", **pad)
+        self._var_dc = tk.StringVar(value=DC_DEFAULT_LABEL)
+        tk.Entry(self, textvariable=self._var_dc,
+                 bg=C.COR_CARD, fg=C.COR_TXT, insertbackground=C.COR_TXT,
+                 font=("Segoe UI", 10), relief="flat", bd=6
+                 ).pack(fill="x", padx=32, pady=(2, 14))
+
+        # Mensagem de erro
+        self._var_msg = tk.StringVar(value="")
+        self._lbl_msg = tk.Label(self, textvariable=self._var_msg,
+                                 bg=C.COR_BG, fg=C.COR_ERR,
+                                 font=("Segoe UI", 8), wraplength=360)
+        self._lbl_msg.pack(pady=(0, 6))
+
+        # Botoes
+        bf = tk.Frame(self, bg=C.COR_BG)
+        bf.pack(pady=6)
+        self._btn_entrar = tk.Button(
+            bf, text="  Entrar  ",
+            bg=C.COR_ACC, fg="white",
+            activebackground="#6a58e0", activeforeground="white",
+            font=("Segoe UI", 11, "bold"), relief="flat",
+            padx=18, pady=7, cursor="hand2",
+            command=self._tentar_login)
+        self._btn_entrar.pack(side="left", padx=8)
+        tk.Button(bf, text="Cancelar",
+                  bg=C.COR_CARD, fg=C.COR_SUB,
+                  activebackground="#3a3a5e",
+                  font=("Segoe UI", 10), relief="flat",
+                  padx=14, pady=7, cursor="hand2",
+                  command=self._cancelar).pack(side="left", padx=8)
+
+        self.bind("<Return>",   lambda _e: self._tentar_login())
+        self.bind("<KP_Enter>", lambda _e: self._tentar_login())
+        self.bind("<Escape>",   lambda _e: self._cancelar())
+        # Foca no campo de usuario ao abrir
+        self.after(80, lambda: self._ent_user.focus_set())
+
+    def _resolver_dc(self):
+        val = self._var_dc.get().strip()
+        return DC_DEFAULT_IP if (not val or val == DC_DEFAULT_LABEL) else val
+
+    def _tentar_login(self):
+        user  = self._var_user.get().strip()
+        senha = self._var_pass.get()
+        if not user or not senha:
+            self._var_msg.set("Preencha o usuário e a senha.")
+            return
+
+        dc = self._resolver_dc()
+        self._var_msg.set("Validando credenciais...")
+        self._btn_entrar.configure(state="disabled", text="Aguardando...")
+        self.update_idletasks()
+
+        # Validacao via bind LDAP em thread separada para nao travar a UI
+        import threading as _threading
+        def _validar():
+            ok, msg = _autenticar_ad(user, senha, dc)
+            self.after(0, lambda: self._resultado_login(ok, msg, user, senha, dc))
+
+        _threading.Thread(target=_validar, daemon=True).start()
+
+    def _resultado_login(self, ok, msg, user, senha, dc):
+        if ok:
+            self.usuario = user
+            self.senha   = senha
+            self.dc      = dc
+            self._autenticado = True
+            self.destroy()
+        else:
+            self._var_msg.set(f"✘  {msg}")
+            self._btn_entrar.configure(state="normal", text="  Entrar  ")
+
+    def _cancelar(self):
+        self.destroy()
+        sys.exit(0)
+
+    @property
+    def autenticado(self):
+        return self._autenticado
+
+
+_GRUPO_RESTRITO = "Admins. do domínio"   # SamAccountName do grupo autorizado
+
+def _autenticar_ad(usuario, senha, dc):
+    """Valida as credenciais fazendo bind LDAP contra o AD e verifica se o
+    usuario pertence ao grupo '_GRUPO_RESTRITO'.
+    Retorna (True, '') em caso de sucesso ou (False, mensagem) em caso de falha.
+    Nao armazena as credenciais em disco.
+    """
+    try:
+        import subprocess as _sp, tempfile as _tf, os as _os
+        grupo_esc = _GRUPO_RESTRITO.replace('"', "'")
+        script = f"""
+$credUser  = \"{usuario.replace('"', "'")}\"
+$credSenha = \"{senha.replace('"', "'")}\"
+$dc        = \"{dc}\"
+$base      = \"DC=umuarama,DC=local\"
+$ldap      = if ($dc) {{ \"LDAP://$dc/$base\" }} else {{ \"LDAP://$base\" }}
+
+# 1. Bind: valida as credenciais
+try {{
+    $root = New-Object System.DirectoryServices.DirectoryEntry($ldap, $credUser, $credSenha)
+    if ($root.Guid -eq $null -or $root.Guid -eq [guid]::Empty) {{
+        Write-Output \"FALHA_CRED|Credenciais invalidas ou DC inacessivel.\"
+        exit
+    }}
+}} catch {{
+    Write-Output \"FALHA_CRED|$($_.Exception.Message)\"
+    exit
+}}
+
+# 2. Localiza o objeto do usuario no AD para obter memberOf recursivo
+try {{
+    $s = New-Object System.DirectoryServices.DirectorySearcher($root)
+    # Extrai apenas o sAMAccountName (sem dominio ex: umuarama\\admin -> admin)
+    $sam = (\"{usuario.replace('"', "'")}\" -split '[\\\\\\\\]')[-1]
+    $s.Filter = \"(&(objectClass=user)(sAMAccountName=$sam))\"
+    $s.SearchScope = \"Subtree\"
+    $s.PropertiesToLoad.Add(\"memberOf\") | Out-Null
+    $res = $s.FindOne()
+    if ($res -eq $null) {{
+        Write-Output \"FALHA_GRUPO|Usuario nao encontrado no diretorio.\"
+        exit
+    }}
+
+    # 3. Verifica memberOf (recursivo via LDAP_MATCHING_RULE_IN_CHAIN)
+    $s2 = New-Object System.DirectoryServices.DirectorySearcher($root)
+    $s2.Filter = \"(&(objectClass=group)(sAMAccountName={grupo_esc}))\"
+    $s2.SearchScope = \"Subtree\"
+    $s2.PropertiesToLoad.Add(\"distinguishedName\") | Out-Null
+    $grp = $s2.FindOne()
+    if ($grp -eq $null) {{
+        Write-Output \"FALHA_GRUPO|Grupo restrito '{grupo_esc}' nao encontrado no AD.\"
+        exit
+    }}
+    $grupoDN = $grp.Properties[\"distinguishedName\"][0]
+
+    # Busca o usuario verificando pertencimento recursivo ao grupo
+    $s3 = New-Object System.DirectoryServices.DirectorySearcher($root)
+    $s3.Filter = \"(&(objectClass=user)(sAMAccountName=$sam)(memberOf:1.2.840.113556.1.4.1941:=$grupoDN))\"
+    $s3.SearchScope = \"Subtree\"
+    $membro = $s3.FindOne()
+    if ($membro -ne $null) {{
+        Write-Output \"OK\"
+    }} else {{
+        Write-Output \"FALHA_GRUPO|Acesso negado. Voce nao pertence ao grupo '{grupo_esc}'.\"
+    }}
+}} catch {{
+    Write-Output \"FALHA_GRUPO|$($_.Exception.Message)\"
+}} finally {{
+    $root.Dispose()
+}}
+"""
+        tmp = _tf.NamedTemporaryFile(suffix=".ps1", delete=False,
+                                    mode="w", encoding="utf-8-sig")
+        tmp.write(script); tmp.close()
+        proc = _sp.Popen(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+             "-File", tmp.name],
+            stdout=_sp.PIPE, stderr=_sp.STDOUT,
+            text=True, encoding="utf-8", errors="replace",
+            creationflags=_sp.CREATE_NO_WINDOW)
+        saida, _ = proc.communicate(timeout=15)
+        _os.unlink(tmp.name)
+        for linha in saida.splitlines():
+            linha = linha.strip()
+            if linha == "OK":
+                return True, ""
+            if linha.startswith("FALHA_CRED|"):
+                return False, linha[11:]
+            if linha.startswith("FALHA_GRUPO|"):
+                return False, linha[12:]
+            if linha.startswith("FALHA|"):   # fallback legado
+                return False, linha[6:]
+        return False, "Resposta inesperada do AD."
+    except Exception as ex:
+        return False, str(ex)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Interface Grafica  —  proporcao 16:9  (1120 × 630)
 # ──────────────────────────────────────────────────────────────────────────────
 class App(tk.Tk):
-    def __init__(self, csv_preload=""):
+    def __init__(self, csv_preload="", sessao_usuario="", sessao_senha="", sessao_dc=""):
         super().__init__()
         self.title("Importar Usuarios AD - Grupo Umuarama")
         self.geometry("1120x630")
@@ -760,6 +1353,10 @@ class App(tk.Tk):
         self.resizable(True, True)
         self.configure(bg="#1e1e2e")
         self._preview_realizado = False
+        # ── Sessao autenticada (credenciais em memoria, sem gravar em disco) ──
+        self._sess_usuario = sessao_usuario
+        self._sess_senha   = sessao_senha
+        self._sess_dc      = sessao_dc
         self._build_ui()
         # Se chamado pelo .bat com CSV ja definido, pre-carrega e faz preview
         if csv_preload and os.path.exists(csv_preload):
@@ -814,6 +1411,10 @@ class App(tk.Tk):
         tab2 = ttk.Frame(self._nb, style="TFrame")
         self._nb.add(tab2, text="  IMPORTAR AD  ")
         self._build_tab_importar(tab2, COR_BG, COR_CARD, COR_ACC, COR_TXT, COR_SUB)
+
+        tab3 = ttk.Frame(self._nb, style="TFrame")
+        self._nb.add(tab3, text="  CONSULTA & GESTÃO AD  ")
+        self._build_tab_gestao(tab3, COR_BG, COR_CARD, COR_ACC, COR_TXT, COR_SUB)
 
         # ── Log compartilhado (abaixo das abas) ────────────────────────────────
         tk.Label(self, text="Log de execucao", bg=COR_BG, fg=COR_SUB,
@@ -907,36 +1508,21 @@ class App(tk.Tk):
             row=0, column=1, padx=8, sticky="ew")
         ttk.Button(card, text="Procurar...", command=self._browse).grid(row=0, column=2)
 
-        # Usuario AD
-        ttk.Label(card, text="Usuario AD (ex: umuarama\\admin):", background=COR_CARD).grid(
+        # Sessao autenticada: exibe o usuario logado (somente leitura)
+        ttk.Label(card, text="Sessão autenticada:", background=COR_CARD).grid(
             row=1, column=0, sticky="w", pady=5)
-        self.var_user = tk.StringVar()
-        ttk.Entry(card, textvariable=self.var_user, width=64).grid(
-            row=1, column=1, padx=8, sticky="ew")
-
-        # Senha
-        ttk.Label(card, text="Senha AD:", background=COR_CARD).grid(
-            row=2, column=0, sticky="w", pady=5)
-        self.var_pass = tk.StringVar()
-        ttk.Entry(card, textvariable=self.var_pass, show="*", width=64).grid(
-            row=2, column=1, padx=8, sticky="ew")
-
-        # Servidor DC — pre-preenchido com label legivel; internamente resolve para IP
-        ttk.Label(card, text="Servidor DC:", background=COR_CARD).grid(
-            row=3, column=0, sticky="w", pady=5)
-        self.var_dc = tk.StringVar(value=DC_DEFAULT_LABEL)
-        ttk.Entry(card, textvariable=self.var_dc, width=64).grid(
-            row=3, column=1, padx=8, sticky="ew")
-        ttk.Label(card,
-                  text=f"({DC_DEFAULT_LABEL}  →  {DC_DEFAULT_IP}  · editavel)",
-                  background=COR_CARD, foreground=COR_SUB,
-                  font=("Segoe UI", 8)).grid(row=3, column=2, sticky="w")
+        lbl_sessao = tk.Label(
+            card,
+            text=f"✔  {self._sess_usuario}  ·  DC: {self._sess_dc or DC_DEFAULT_LABEL}",
+            bg=COR_CARD, fg="#a6e3a1",
+            font=("Segoe UI", 9))
+        lbl_sessao.grid(row=1, column=1, sticky="w", padx=8)
 
         # Forcar troca de senha
         self.var_troca = tk.BooleanVar(value=True)
         ttk.Checkbutton(card, text="Forcar troca de senha no 1 login",
                         variable=self.var_troca).grid(
-            row=4, column=1, sticky="w", padx=8, pady=6)
+            row=2, column=1, sticky="w", padx=8, pady=6)
         card.columnconfigure(1, weight=1)
 
         # Botoes
@@ -951,10 +1537,10 @@ class App(tk.Tk):
     # ── Helpers gerais ─────────────────────────────────────────────────────────
     def _resolver_dc(self):
         """Retorna o host/IP real para conexao LDAP.
-        'umuarama.local' e campo vazio resolvem para DC_DEFAULT_IP (10.56.24.10).
-        Qualquer outro valor digitado pelo operador e usado diretamente.
+        Usa o DC da sessao autenticada no login; 'umuarama.local' e campo
+        vazio resolvem para DC_DEFAULT_IP (10.56.24.10).
         """
-        val = self.var_dc.get().strip()
+        val = self._sess_dc.strip() if self._sess_dc else ""
         return DC_DEFAULT_IP if (not val or val == DC_DEFAULT_LABEL) else val
 
     def _toggle_data_field(self):
@@ -1118,13 +1704,12 @@ class App(tk.Tk):
             messagebox.showerror("Erro", "E obrigatorio realizar a Pre-visualizacao antes de importar para o AD.")
             return
         path  = self.var_csv.get().strip()
-        user  = self.var_user.get().strip()
-        senha = self.var_pass.get()
+        # Usa credenciais da sessao autenticada no login
+        user  = self._sess_usuario
+        senha = self._sess_senha
         dc    = self._resolver_dc()
         if not path or not os.path.exists(path):
             messagebox.showerror("Erro", "Selecione um arquivo CSV valido."); return
-        if not user or not senha:
-            messagebox.showerror("Erro", "Informe usuario e senha AD."); return
 
         usuarios, erros = parse_csv_admissoes(path)
         if erros:
@@ -1379,7 +1964,8 @@ class App(tk.Tk):
             proc = subprocess.Popen(
                 ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", tmp.name],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                env=env, text=True, encoding="utf-8", errors="replace"
+                env=env, text=True, encoding="utf-8", errors="replace",
+                creationflags=subprocess.CREATE_NO_WINDOW
             )
             for linha in proc.stdout:
                 linha = linha.rstrip()
@@ -1434,7 +2020,6 @@ class App(tk.Tk):
     @staticmethod
     def _salvar_log_csv(dc, registros, c, csv_origem):
         """Gera um arquivo .csv em logs/ com o resumo da importacao, ordenado por nome em ordem alfabetica."""
-        import datetime
         pasta_logs = os.path.join(obter_diretorio_base(), "logs")
         os.makedirs(pasta_logs, exist_ok=True)
         agora = datetime.datetime.now()
@@ -1492,7 +2077,8 @@ class App(tk.Tk):
             proc = subprocess.Popen(
                 ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", tmp.name],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                env=env, text=True, encoding="utf-8", errors="replace"
+                env=env, text=True, encoding="utf-8", errors="replace",
+                creationflags=subprocess.CREATE_NO_WINDOW
             )
             c = {"ok": 0, "erro": 0, "existe": 0}
             u_atual = None   # usuario sendo processado no momento
@@ -1552,6 +2138,30 @@ class App(tk.Tk):
                                 r_item.update({"status": "CONFLITO DE LOGIN", "detalhe": f"Nome no AD: {conflict_name}"})
                         self._log(f"     CONFLITO DE LOGIN (Nome diferente no AD) - sera tratado apos o batch...", "aviso")
                         c["existe"] += 1
+                    elif status == "OK_READMITIDO":
+                        caminho = ou_para_caminho(detalhe)
+                        v_stat = vpn_status.get(sam, "NAO")
+                        self._log(f"     ✔  READMITIDO (CPF)  →  {caminho}", "ok")
+                        c["ok"] += 1
+                        if r_item:
+                            r_item.update({"status": "READMITIDO", "ou": detalhe, "vpn": v_stat,
+                                           "detalhe": "Conta reativada e atualizada via CPF"})
+                        if v_stat == "SIM":
+                            self._log(f"     → Adicionado ao grupo VPN (UsuariosVPN)", "ok")
+                        elif v_stat.startswith("ERRO:"):
+                            self._log(f"     ⚠ Falha VPN: {v_stat[5:].strip()}", "aviso")
+                    elif status == "CONFLITO_CPF":
+                        # CPF ja existe em conta ATIVA com outro login
+                        partes_cpf = detalhe.split("|", 1)
+                        sam_existente = partes_cpf[0] if partes_cpf else "?"
+                        nome_existente = partes_cpf[1] if len(partes_cpf) > 1 else "?"
+                        self._log(
+                            f"     ⚠  CPF JA EXISTE em conta ATIVA: '{sam_existente}' ({nome_existente})"
+                            f" — usuario '{sam}' nao importado.", "aviso")
+                        c["existe"] += 1
+                        if r_item:
+                            r_item.update({"status": "CONFLITO CPF",
+                                           "detalhe": f"CPF ja consta na conta ativa: {sam_existente}"})
                     else:
                         self._log(f"     ERRO - {detalhe}", "erro"); c["erro"] += 1
                         if r_item:
@@ -1606,6 +2216,603 @@ class App(tk.Tk):
             except Exception as e_log:
                 self._log(f"  Aviso: nao foi possivel salvar o log CSV - {e_log}", "aviso")
 
+    # ── Aba 3: CONSULTA & GESTÃO AD ───────────────────────────────────────────
+    def _build_tab_gestao(self, parent, COR_BG, COR_CARD, COR_ACC, COR_TXT, COR_SUB):
+        """Constroi a aba de consulta e gestao de contas no AD."""
+        COR_OK    = "#a6e3a1"
+        COR_ERR   = "#f38ba8"
+
+        # ── Secao de busca ────────────────────────────────────────────────────
+        card_busca = ttk.Frame(parent, style="Card.TFrame", padding=14)
+        card_busca.pack(fill="x", padx=0, pady=6)
+
+        ttk.Label(card_busca, text="Buscar colaborador:", background=COR_CARD).grid(
+            row=0, column=0, sticky="w", pady=5)
+        self.var_gestao_termo = tk.StringVar()
+        ent_busca = ttk.Entry(card_busca, textvariable=self.var_gestao_termo, width=46)
+        ent_busca.grid(row=0, column=1, padx=8, sticky="ew")
+        ttk.Label(card_busca,
+                  text="(CPF, login ou nome completo)",
+                  background=COR_CARD, foreground=COR_SUB,
+                  font=("Segoe UI", 8)).grid(row=0, column=2, sticky="w")
+        card_busca.columnconfigure(1, weight=1)
+
+        bf_busca = ttk.Frame(parent, style="TFrame")
+        bf_busca.pack(pady=(0, 4))
+        self._btn_consultar = ttk.Button(bf_busca, text="Consultar",
+                                         style="Accent.TButton",
+                                         command=self._consultar_usuario)
+        self._btn_consultar.pack(side="left", padx=6)
+        ttk.Button(bf_busca, text="Limpar",
+                   command=self._limpar_card_usuario).pack(side="left", padx=6)
+
+        ent_busca.bind("<Return>",    lambda _e: self._consultar_usuario())
+        ent_busca.bind("<KP_Enter>",  lambda _e: self._consultar_usuario())
+
+        # ── Card de resultado ─────────────────────────────────────────────────
+        self._card_resultado = ttk.Frame(parent, style="Card.TFrame", padding=14)
+        self._card_resultado.pack(fill="x", padx=0, pady=2)
+
+        # Badge de status
+        self._lbl_status_badge = tk.Label(
+            self._card_resultado, text="", width=16,
+            font=("Segoe UI", 9, "bold"), relief="flat", bd=0)
+        self._lbl_status_badge.grid(row=0, column=2, sticky="e", padx=(0, 4), pady=4)
+
+        # Campos informativos
+        _labels = [
+            ("Nome completo:", "var_g_nome"),
+            ("Login (SAM):",   "var_g_login"),
+            ("E-mail:",        "var_g_email"),
+            ("CPF:",           "var_g_cpf"),
+            ("Localização:",   "var_g_ou"),
+        ]
+        for i, (lbl, var_name) in enumerate(_labels):
+            setattr(self, var_name, tk.StringVar(value="—"))
+            ttk.Label(self._card_resultado, text=lbl,
+                      background=COR_CARD, font=("Segoe UI", 9, "bold")).grid(
+                row=i, column=0, sticky="w", pady=2, padx=(0, 8))
+            ttk.Label(self._card_resultado, textvariable=getattr(self, var_name),
+                      background=COR_CARD, wraplength=520, justify="left").grid(
+                row=i, column=1, sticky="w", pady=2)
+
+        self._card_resultado.columnconfigure(1, weight=1)
+
+        # Armazena sam e dn do usuario atual para uso nas acoes
+        self._gestao_sam = ""
+        self._gestao_dn  = ""
+        self._gestao_uac = 0
+
+        # ── Painel de acoes ───────────────────────────────────────────────────
+        card_acoes = ttk.Frame(parent, style="Card.TFrame", padding=12)
+        card_acoes.pack(fill="x", padx=0, pady=(2, 4))
+
+        tk.Label(card_acoes, text="Ações na conta:", bg=COR_CARD, fg=COR_SUB,
+                 font=("Segoe UI", 8, "bold")).pack(anchor="w", pady=(0, 6))
+
+        bf_acoes = tk.Frame(card_acoes, bg=COR_CARD)
+        bf_acoes.pack(fill="x")
+
+        self._btn_alterar_senha = tk.Button(
+            bf_acoes, text="🔑  Alterar Senha",
+            bg="#313244", fg=COR_TXT, activebackground="#45475a",
+            font=("Segoe UI", 10), relief="flat", padx=14, pady=5,
+            cursor="hand2", state="disabled",
+            command=self._acao_alterar_senha)
+        self._btn_alterar_senha.pack(side="left", padx=(0, 8))
+
+        self._btn_desativar = tk.Button(
+            bf_acoes, text="🚫  Desativar",
+            bg="#313244", fg=COR_ERR, activebackground="#45475a",
+            font=("Segoe UI", 10), relief="flat", padx=14, pady=5,
+            cursor="hand2", state="disabled",
+            command=self._acao_desativar)
+        self._btn_desativar.pack(side="left", padx=(0, 8))
+
+        self._btn_reativar = tk.Button(
+            bf_acoes, text="🔄  Reativar / Readmissão",
+            bg="#313244", fg=COR_OK, activebackground="#45475a",
+            font=("Segoe UI", 10), relief="flat", padx=14, pady=5,
+            cursor="hand2", state="disabled",
+            command=self._acao_reativar)
+        self._btn_reativar.pack(side="left", padx=(0, 8))
+
+        # Guarda referencia as cores para reuso nos metodos de acao
+        self._G = {
+            "COR_BG": COR_BG, "COR_CARD": COR_CARD, "COR_ACC": COR_ACC,
+            "COR_TXT": COR_TXT, "COR_SUB": COR_SUB,
+            "COR_OK": COR_OK,   "COR_ERR": COR_ERR,
+        }
+
+    # ── Consultar colaborador no AD ───────────────────────────────────────────
+    def _consultar_usuario(self):
+        termo = self.var_gestao_termo.get().strip()
+        if not termo:
+            messagebox.showwarning("Atenção", "Informe CPF, login ou nome para buscar.")
+            return
+        # Usa credenciais da sessao autenticada
+        user  = self._sess_usuario
+        senha = self._sess_senha
+        dc    = self._resolver_dc()
+        self._btn_consultar.configure(state="disabled")
+        self.var_status.set("Consultando AD...")
+        self._limpar_card_usuario()
+        threading.Thread(
+            target=self._executar_consulta,
+            args=(termo, user, senha, dc), daemon=True).start()
+
+    def _executar_consulta(self, termo, user, senha, dc):
+        script = gerar_ps1_consultar(termo, dc)
+        tmp = tempfile.NamedTemporaryFile(suffix=".ps1", delete=False, mode="w", encoding="utf-8")
+        tmp.write(script); tmp.close()
+        env = os.environ.copy()
+        env["UMU_USER"] = user
+        env["UMU_PASS"] = senha
+        resultados = []
+        erro_msg = ""
+        try:
+            proc = subprocess.Popen(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", tmp.name],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                env=env, text=True, encoding="utf-8", errors="replace",
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+            for linha in proc.stdout:
+                linha = linha.rstrip()
+                if linha.startswith("ENCONTRADO|"):
+                    partes = linha.split("|", 6)
+                    # ENCONTRADO|sam|nome|email|cpf|uac|dn
+                    if len(partes) >= 7:
+                        resultados.append({
+                            "sam": partes[1], "nome": partes[2],
+                            "email": partes[3], "cpf": partes[4],
+                            "uac": int(partes[5]) if partes[5].lstrip("-").isdigit() else 512,
+                            "dn": partes[6],
+                        })
+                elif linha.startswith("ERRO|"):
+                    erro_msg = linha[5:]
+                elif linha == "FIM":
+                    break
+            proc.wait()
+        finally:
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
+
+        if erro_msg:
+            self.after(0, lambda: self._exibir_resultado_consulta({"erro": erro_msg}))
+        elif not resultados:
+            self.after(0, lambda: self._exibir_resultado_consulta(None))
+        elif len(resultados) == 1:
+            self.after(0, lambda: self._exibir_resultado_consulta(resultados[0]))
+        else:
+            # Multiplos resultados: verifica se ha match exato em sam ou cpf
+            termo_lower = termo.strip().lower()
+            termo_dig = re.sub(r'\D', '', termo_lower)
+            exato = None
+            for r in resultados:
+                if r["sam"].lower() == termo_lower:
+                    exato = r
+                    break
+                cpf_limpo = re.sub(r'\D', '', r.get("cpf", ""))
+                if termo_dig and len(termo_dig) >= 8 and (cpf_limpo == termo_dig or cpf_limpo.lstrip('0') == termo_dig.lstrip('0')):
+                    exato = r
+                    break
+            if exato:
+                self.after(0, lambda: self._exibir_resultado_consulta(exato))
+            else:
+                self.after(0, lambda: self._abrir_modal_selecao_usuarios(resultados, termo))
+
+    def _exibir_resultado_consulta(self, resultado):
+        self._btn_consultar.configure(state="normal")
+        G = self._G
+        if resultado is None:
+            self.var_status.set("Nenhum colaborador encontrado.")
+            self._log("  Nenhum colaborador encontrado para o termo informado.", "aviso")
+            messagebox.showinfo("Não encontrado",
+                                "Nenhuma conta localizada no AD com esse CPF, login ou nome.")
+            return
+        if "erro" in resultado:
+            self.var_status.set("Erro na consulta.")
+            self._log(f"  Erro ao consultar AD: {resultado['erro']}", "erro")
+            messagebox.showerror("Erro de consulta", resultado["erro"])
+            return
+
+        sam  = resultado["sam"]
+        nome = resultado["nome"]
+        uac  = resultado["uac"]
+        dn   = resultado["dn"]
+        is_disabled = (uac & 2) == 2
+
+        # Preenche o card
+        self.var_g_nome.set(nome or "—")
+        self.var_g_login.set(sam or "—")
+        self.var_g_email.set(resultado["email"] or "—")
+        self.var_g_cpf.set(resultado["cpf"] or "—")
+        # OU legivel: extrai da DN
+        ou_dn = re.sub(r"^CN=[^,]+,\s*", "", dn)
+        self.var_g_ou.set(ou_para_caminho(ou_dn) if ou_dn else "—")
+
+        # Badge de status
+        if is_disabled:
+            self._lbl_status_badge.configure(
+                text="  DESATIVADO  ", bg="#f38ba8", fg="#1e1e2e")
+        else:
+            self._lbl_status_badge.configure(
+                text="  ATIVO  ", bg="#a6e3a1", fg="#1e1e2e")
+
+        # Habilita botoes de acao de acordo com o estado
+        self._gestao_sam = sam
+        self._gestao_dn  = dn
+        self._gestao_uac = uac
+
+        self._btn_alterar_senha.configure(state="normal")
+        if is_disabled:
+            self._btn_desativar.configure(state="disabled")
+            self._btn_reativar.configure(state="normal")
+        else:
+            self._btn_desativar.configure(state="normal")
+            self._btn_reativar.configure(state="disabled")
+
+        self.var_status.set(f"Encontrado: {nome}  ({'DESATIVADO' if is_disabled else 'ATIVO'})")
+        self._log(f"  Consulta: {nome} ({sam}) — {'DESATIVADO' if is_disabled else 'ATIVO'}", "ok")
+
+    def _limpar_card_usuario(self):
+        """Reseta o card de resultado e desabilita os botoes de acao."""
+        for v in ("var_g_nome", "var_g_login", "var_g_email", "var_g_cpf", "var_g_ou"):
+            if hasattr(self, v):
+                getattr(self, v).set("—")
+        if hasattr(self, "_lbl_status_badge"):
+            self._lbl_status_badge.configure(text="", bg=self._G.get("COR_CARD", "#2a2a3e"))
+        self._gestao_sam = ""
+        self._gestao_dn  = ""
+        self._gestao_uac = 0
+        for btn in ("_btn_alterar_senha", "_btn_desativar", "_btn_reativar"):
+            if hasattr(self, btn):
+                getattr(self, btn).configure(state="disabled")
+
+    def _abrir_modal_selecao_usuarios(self, lista, termo):
+        """Abre modal para o operador escolher quando a busca retorna multiplas contas."""
+        self._btn_consultar.configure(state="normal")
+        self.var_status.set(f"{len(lista)} colaboradores encontrados para '{termo}'.")
+        self._log(f"  Consulta: {len(lista)} contas encontradas para '{termo}'. Selecione uma.", "aviso")
+
+        G = self._G
+        dlg = tk.Toplevel(self)
+        dlg.title("Selecionar Colaborador")
+        dlg.configure(bg=G["COR_BG"])
+        dlg.geometry("740x420")
+        dlg.minsize(620, 320)
+        dlg.grab_set()
+
+        # Centraliza na janela pai
+        self.update_idletasks()
+        px = self.winfo_x() + max(0, (self.winfo_width() - 740) // 2)
+        py = self.winfo_y() + max(0, (self.winfo_height() - 420) // 2)
+        dlg.geometry(f"740x420+{px}+{py}")
+
+        header = tk.Frame(dlg, bg=G["COR_BG"])
+        header.pack(fill="x", padx=16, pady=(12, 6))
+        tk.Label(header, text="🔍  Várias contas localizadas", bg=G["COR_BG"], fg=G["COR_ACC"],
+                 font=("Segoe UI", 12, "bold")).pack(anchor="w")
+        tk.Label(header, text=f"Foram encontradas {len(lista)} contas para '{termo}'. Selecione a conta desejada:",
+                 bg=G["COR_BG"], fg=G["COR_TXT"], font=("Segoe UI", 9)).pack(anchor="w", pady=(2, 0))
+
+        # Treeview de resultados
+        frame_tree = tk.Frame(dlg, bg=G["COR_BG"])
+        frame_tree.pack(fill="both", expand=True, padx=16, pady=6)
+
+        cols = ("nome", "sam", "cpf", "status", "ou")
+        tree = ttk.Treeview(frame_tree, columns=cols, show="headings", selectmode="browse")
+        tree.heading("nome", text="Nome Completo")
+        tree.heading("sam", text="Login")
+        tree.heading("cpf", text="CPF")
+        tree.heading("status", text="Status")
+        tree.heading("ou", text="Localização")
+
+        tree.column("nome", width=220, minwidth=140)
+        tree.column("sam", width=130, minwidth=90)
+        tree.column("cpf", width=110, minwidth=80)
+        tree.column("status", width=90, minwidth=70, anchor="center")
+        tree.column("ou", width=170, minwidth=120)
+
+        sb = ttk.Scrollbar(frame_tree, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=sb.set)
+        tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+
+        for idx, u in enumerate(lista):
+            is_dis = (u["uac"] & 2) == 2
+            st_text = "DESATIVADO" if is_dis else "ATIVO"
+            ou_dn = re.sub(r"^CN=[^,]+,\s*", "", u["dn"])
+            caminho_ou = ou_para_caminho(ou_dn) if ou_dn else "—"
+            tree.insert("", "end", iid=str(idx), values=(
+                u["nome"] or "—",
+                u["sam"] or "—",
+                u["cpf"] or "—",
+                st_text,
+                caminho_ou
+            ))
+
+        def _confirmar():
+            sel = tree.selection()
+            if not sel:
+                return
+            idx = int(sel[0])
+            dlg.destroy()
+            self._exibir_resultado_consulta(lista[idx])
+
+        tree.bind("<Double-1>", lambda _e: _confirmar())
+        tree.bind("<Return>", lambda _e: _confirmar())
+
+        bf = tk.Frame(dlg, bg=G["COR_BG"])
+        bf.pack(fill="x", padx=16, pady=(6, 12))
+        tk.Button(bf, text="Selecionar", bg=G["COR_ACC"], fg="white",
+                  activebackground="#6a58e0", font=("Segoe UI", 9, "bold"),
+                  relief="flat", padx=14, pady=5, cursor="hand2",
+                  command=_confirmar).pack(side="left", padx=(0, 8))
+        tk.Button(bf, text="Cancelar", bg=G["COR_CARD"], fg=G["COR_SUB"],
+                  activebackground="#3a3a5e", font=("Segoe UI", 9),
+                  relief="flat", padx=14, pady=5, cursor="hand2",
+                  command=dlg.destroy).pack(side="left")
+
+        if lista:
+            tree.selection_set("0")
+            tree.focus("0")
+
+    # ── Acao: Alterar Senha ───────────────────────────────────────────────────
+    def _acao_alterar_senha(self):
+        if not self._gestao_sam:
+            return
+        G = self._G
+        dlg = tk.Toplevel(self)
+        dlg.title("Alterar Senha")
+        dlg.configure(bg=G["COR_BG"])
+        dlg.resizable(False, False)
+        self.update_idletasks()
+        larg, alt = 440, 280
+        px = self.winfo_x() + max(0, (self.winfo_width() - larg) // 2)
+        py = self.winfo_y() + max(0, (self.winfo_height() - alt) // 2)
+        dlg.geometry(f"{larg}x{alt}+{px}+{py}")
+        dlg.grab_set()
+
+        cont = tk.Frame(dlg, bg=G["COR_BG"])
+        cont.pack(fill="both", expand=True, padx=20, pady=16)
+
+        tk.Label(cont, text="🔑  Alterar Senha", bg=G["COR_BG"], fg=G["COR_ACC"],
+                 font=("Segoe UI", 12, "bold")).pack(pady=(0, 4))
+        tk.Label(cont, text=f"Conta: {self._gestao_sam}",
+                 bg=G["COR_BG"], fg=G["COR_TXT"], font=("Segoe UI", 9)).pack(pady=(0, 10))
+
+        tk.Label(cont, text="Nova senha:", bg=G["COR_BG"], fg=G["COR_TXT"],
+                 font=("Segoe UI", 9)).pack(anchor="w")
+        var_senha = tk.StringVar(value=self._gerar_senha_padrao(self.var_g_nome.get()))
+        row_s = tk.Frame(cont, bg=G["COR_BG"])
+        row_s.pack(fill="x", pady=(2, 6))
+        ent_senha = tk.Entry(row_s, textvariable=var_senha, bg=G["COR_CARD"], fg=G["COR_TXT"],
+                             insertbackground=G["COR_TXT"], font=("Segoe UI", 11),
+                             relief="flat", bd=6)
+        ent_senha.pack(side="left", fill="x", expand=True)
+        tk.Button(row_s, text="⟳", bg=G["COR_CARD"], fg=G["COR_SUB"],
+                  relief="flat", font=("Segoe UI", 11), cursor="hand2",
+                  command=lambda: var_senha.set(
+                      self._gerar_senha_padrao(self.var_g_nome.get()))
+                  ).pack(side="left", padx=(4, 0))
+
+        var_troca = tk.BooleanVar(value=True)
+        tk.Checkbutton(cont, text="Forçar troca no próximo logon",
+                       variable=var_troca, bg=G["COR_BG"], fg=G["COR_TXT"],
+                       selectcolor=G["COR_CARD"], activebackground=G["COR_BG"],
+                       font=("Segoe UI", 9)).pack(anchor="w", pady=(0, 10))
+
+        def _confirmar():
+            senha = var_senha.get().strip()
+            if not senha:
+                messagebox.showwarning("Atenção", "Informe a nova senha.", parent=dlg)
+                return
+            dlg.destroy()
+            self._executar_acao_ad("alterar_senha", self._gestao_sam,
+                                   nova_senha=senha, forcar_troca=var_troca.get())
+
+        bf = tk.Frame(cont, bg=G["COR_BG"])
+        bf.pack(pady=4)
+        tk.Button(bf, text="Confirmar", bg=G["COR_ACC"], fg="white",
+                  activebackground="#6a58e0", font=("Segoe UI", 10, "bold"),
+                  relief="flat", padx=14, pady=5, cursor="hand2",
+                  command=_confirmar).pack(side="left", padx=8)
+        tk.Button(bf, text="Cancelar", bg=G["COR_CARD"], fg=G["COR_SUB"],
+                  activebackground="#3a3a5e", font=("Segoe UI", 10),
+                  relief="flat", padx=14, pady=5, cursor="hand2",
+                  command=dlg.destroy).pack(side="left", padx=8)
+        dlg.bind("<Return>",   lambda _e: _confirmar())
+        dlg.bind("<Escape>",   lambda _e: dlg.destroy())
+        ent_senha.focus_set()
+
+    # ── Acao: Desativar ───────────────────────────────────────────────────────
+    def _acao_desativar(self):
+        if not self._gestao_sam:
+            return
+        sam  = self._gestao_sam
+        nome = self.var_g_nome.get()
+        if not messagebox.askyesno(
+                "Confirmar desativação",
+                f"Desativar a conta '{sam}' ({nome}) no Active Directory?\n\n"
+                f"O colaborador perderá o acesso imediatamente."):
+            return
+        self._executar_acao_ad("desativar", sam)
+
+    # ── Acao: Reativar / Readmissao ───────────────────────────────────────────
+    def _acao_reativar(self):
+        if not self._gestao_sam:
+            return
+        G    = self._G
+        sam  = self._gestao_sam
+        nome = self.var_g_nome.get()
+
+        dlg = tk.Toplevel(self)
+        dlg.title("Reativar / Readmissão")
+        dlg.configure(bg=G["COR_BG"])
+        dlg.resizable(False, False)
+        self.update_idletasks()
+        larg, alt = 500, 360
+        px = self.winfo_x() + max(0, (self.winfo_width() - larg) // 2)
+        py = self.winfo_y() + max(0, (self.winfo_height() - alt) // 2)
+        dlg.geometry(f"{larg}x{alt}+{px}+{py}")
+        dlg.grab_set()
+
+        cont = tk.Frame(dlg, bg=G["COR_BG"])
+        cont.pack(fill="both", expand=True, padx=20, pady=16)
+
+        tk.Label(cont, text="🔄  Reativar / Readmissão", bg=G["COR_BG"], fg=G["COR_OK"],
+                 font=("Segoe UI", 12, "bold")).pack(pady=(0, 2))
+        tk.Label(cont, text=f"Conta: {sam}  ({nome})",
+                 bg=G["COR_BG"], fg=G["COR_TXT"], font=("Segoe UI", 9)).pack(pady=(0, 10))
+
+        # Nova senha
+        tk.Label(cont, text="Nova senha temporária:", bg=G["COR_BG"], fg=G["COR_TXT"],
+                 font=("Segoe UI", 9)).pack(anchor="w")
+        var_senha = tk.StringVar(value=self._gerar_senha_padrao(nome))
+        row_s = tk.Frame(cont, bg=G["COR_BG"])
+        row_s.pack(fill="x", pady=(2, 6))
+        ent_senha = tk.Entry(row_s, textvariable=var_senha, bg=G["COR_CARD"], fg=G["COR_TXT"],
+                             insertbackground=G["COR_TXT"], font=("Segoe UI", 11),
+                             relief="flat", bd=6)
+        ent_senha.pack(side="left", fill="x", expand=True)
+        tk.Button(row_s, text="⟳", bg=G["COR_CARD"], fg=G["COR_SUB"],
+                  relief="flat", font=("Segoe UI", 11), cursor="hand2",
+                  command=lambda: var_senha.set(self._gerar_senha_padrao(nome))
+                  ).pack(side="left", padx=(4, 0))
+
+        var_troca = tk.BooleanVar(value=True)
+        tk.Checkbutton(cont, text="Forçar troca no próximo logon",
+                       variable=var_troca, bg=G["COR_BG"], fg=G["COR_TXT"],
+                       selectcolor=G["COR_CARD"], activebackground=G["COR_BG"],
+                       font=("Segoe UI", 9)).pack(anchor="w", pady=(0, 8))
+
+        # Nova OU (opcional)
+        tk.Label(cont, text="Nova OU (opcional — para readmissão em outra unidade):",
+                 bg=G["COR_BG"], fg=G["COR_TXT"], font=("Segoe UI", 9)).pack(anchor="w")
+        tk.Label(cont,
+                 text="Deixe em branco para manter na OU atual.",
+                 bg=G["COR_BG"], fg=G["COR_SUB"], font=("Segoe UI", 8)).pack(anchor="w")
+        var_ou = tk.StringVar()
+        ttk.Entry(cont, textvariable=var_ou).pack(fill="x", pady=(2, 10))
+
+        def _confirmar():
+            senha = var_senha.get().strip()
+            if not senha:
+                messagebox.showwarning("Atenção", "Informe a nova senha temporária.", parent=dlg)
+                return
+            dlg.destroy()
+            self._executar_acao_ad("reativar", sam,
+                                   nova_senha=senha,
+                                   forcar_troca=var_troca.get(),
+                                   nova_ou=var_ou.get().strip())
+
+        bf = tk.Frame(cont, bg=G["COR_BG"])
+        bf.pack(pady=4)
+        tk.Button(bf, text="Reativar", bg=G["COR_OK"], fg="#1e1e2e",
+                  activebackground="#89d8a1", font=("Segoe UI", 10, "bold"),
+                  relief="flat", padx=14, pady=5, cursor="hand2",
+                  command=_confirmar).pack(side="left", padx=8)
+        tk.Button(bf, text="Cancelar", bg=G["COR_CARD"], fg=G["COR_SUB"],
+                  activebackground="#3a3a5e", font=("Segoe UI", 10),
+                  relief="flat", padx=14, pady=5, cursor="hand2",
+                  command=dlg.destroy).pack(side="left", padx=8)
+        dlg.bind("<Return>", lambda _e: _confirmar())
+        dlg.bind("<Escape>", lambda _e: dlg.destroy())
+        ent_senha.focus_set()
+
+    # ── Executa acao administrativa via PowerShell ────────────────────────────
+    def _executar_acao_ad(self, acao, sam, nova_senha="", forcar_troca=True, nova_ou=""):
+        # Usa credenciais da sessao autenticada
+        user  = self._sess_usuario
+        senha = self._sess_senha
+        dc    = self._resolver_dc()
+
+        nomes_acao = {
+            "alterar_senha": "Alterando senha",
+            "desativar":     "Desativando conta",
+            "reativar":      "Reativando conta",
+        }
+        self.var_status.set(f"{nomes_acao.get(acao, acao)} de {sam}...")
+
+        def _run():
+            script = gerar_ps1_acao(acao, sam, dc,
+                                    nova_senha=nova_senha,
+                                    forcar_troca=forcar_troca,
+                                    nova_ou=nova_ou)
+            tmp = tempfile.NamedTemporaryFile(
+                suffix=".ps1", delete=False, mode="w", encoding="utf-8")
+            tmp.write(script); tmp.close()
+            env = os.environ.copy()
+            env["UMU_USER"] = user
+            env["UMU_PASS"] = senha
+            msg_ok   = ""
+            msg_erro = ""
+            try:
+                proc = subprocess.Popen(
+                    ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                     "-File", tmp.name],
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    env=env, text=True, encoding="utf-8", errors="replace",
+                    creationflags=subprocess.CREATE_NO_WINDOW
+                )
+                for linha in proc.stdout:
+                    linha = linha.rstrip()
+                    if linha.startswith("ACAO_OK|"):
+                        partes = linha.split("|", 2)
+                        msg_ok = partes[2] if len(partes) > 2 else "Concluido."
+                    elif linha.startswith("ACAO_ERRO|"):
+                        partes = linha.split("|", 2)
+                        msg_erro = partes[2] if len(partes) > 2 else "Erro desconhecido."
+                    elif linha == "FIM":
+                        break
+                proc.wait()
+            finally:
+                try:
+                    os.unlink(tmp.name)
+                except OSError:
+                    pass
+
+            def _atualizar():
+                if msg_ok:
+                    self._log(f"  ✔  [{sam}] {msg_ok}", "ok")
+                    self.var_status.set(f"OK: {sam} — {msg_ok}")
+                    # Atualiza o badge de status se desativou ou reativou
+                    if acao == "desativar":
+                        self._lbl_status_badge.configure(
+                            text="  DESATIVADO  ", bg="#f38ba8", fg="#1e1e2e")
+                        self._btn_desativar.configure(state="disabled")
+                        self._btn_reativar.configure(state="normal")
+                    elif acao == "reativar":
+                        self._lbl_status_badge.configure(
+                            text="  ATIVO  ", bg="#a6e3a1", fg="#1e1e2e")
+                        self._btn_desativar.configure(state="normal")
+                        self._btn_reativar.configure(state="disabled")
+                        # Re-consulta para atualizar OU no card apos possivel movimentacao
+                        self.after(500, self._consultar_usuario)
+                elif msg_erro:
+                    self._log(f"  ✘  [{sam}] {msg_erro}", "erro")
+                    self.var_status.set(f"Erro em {sam}: {msg_erro}")
+                    messagebox.showerror("Erro na ação", msg_erro)
+
+            self.after(0, _atualizar)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    # ── Gerador de senha padrao ───────────────────────────────────────────────
+    @staticmethod
+    def _gerar_senha_padrao(nome_completo):
+        """Gera a senha padrao @PrimeiroNome2026 a partir do nome completo."""
+        primeiro = nome_completo.strip().split()[0] if nome_completo.strip() else "Colaborador"
+        primeiro = unicodedata.normalize("NFD", primeiro).encode("ascii", "ignore").decode()
+        if len(primeiro) >= 2:
+            return "@" + primeiro[0].upper() + primeiro[1:].lower() + "2026"
+        return "@" + primeiro.upper() + "2026"
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Entry point
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1621,10 +2828,25 @@ if __name__ == "__main__":
         args = parser.parse_args()
         modo_bat(args)
     else:
+        # ── 1. Tela de login — valida contra o AD antes de abrir a janela principal
+        login_dlg = DialogLogin()
+        login_dlg.mainloop()
+
+        if not login_dlg.autenticado:
+            # Operador fechou ou cancelou o login — encerra sem abrir a app
+            sys.exit(0)
+
+        # ── 2. Sessao validada — abre a janela principal com as credenciais em memoria
         csv_preload = ""
         if "--csv-preload" in sys.argv:
             idx = sys.argv.index("--csv-preload")
             if idx + 1 < len(sys.argv):
                 csv_preload = sys.argv[idx + 1]
-        app = App(csv_preload=csv_preload)
+
+        app = App(
+            csv_preload=csv_preload,
+            sessao_usuario=login_dlg.usuario,
+            sessao_senha=login_dlg.senha,
+            sessao_dc=login_dlg.dc,
+        )
         app.mainloop()
