@@ -59,7 +59,7 @@ Ele solicitará seu usuário (ex: `seu.nome@umuarama.local`) e senha da rede par
 
 ## 🖥️ Módulos da Interface Gráfica (GUI)
 
-O aplicativo [ImportarUsuariosUmuarama.py](file:///c:/Users/Pedro%20Lima/Documents/IMPORT_COLABORADORES/ImportarUsuariosUmuarama.py) (ou executável `ImportarUsuariosUmuarama.exe`) disponibiliza 3 abas de operação:
+O aplicativo [ImportarUsuariosUmuarama.py](file:///c:/Users/Pedro%20Lima/Documents/IMPORT_COLABORADORES/ImportarUsuariosUmuarama.py) (ou executável `ImportarUsuariosUmuarama.exe`) disponibiliza 4 abas de operação:
 
 ### 1. 📂 Aba "GERAR CSV" (ETL)
 - Seleção manual ou automática do arquivo `FPRE111-*.CSV`.
@@ -80,6 +80,17 @@ O aplicativo [ImportarUsuariosUmuarama.py](file:///c:/Users/Pedro%20Lima/Documen
   - **Alterar Senha:** Modal com pré-preenchimento da senha padronizada `@Primeironome2026`, botão de regerar e flag de expiração no logon.
   - **Desativar:** Confirmação segura para desativar colaborador desligado imediatamente.
   - **Reativar / Readmissão:** Reabilitação da conta com redefinição de senha e campo opcional para mover o colaborador de OU (caso tenha mudado de concessionária ou holding).
+  - **+ Criar Usuário (PJ):** Atalho direto para abertura do formulário individual pre-preenchido caso o colaborador não exista no AD.
+
+### 4. 👤 Aba "CRIAR USUÁRIO (PJ)" (Criação Individual)
+- Provisionamento direto no Active Directory para contratações PJ, prestadores de serviço ou terceirizados que não constam na exportação Senior/FPRE111.
+- **Mesmos campos padronizados:**
+  - **Nome Completo:** Geração automática e dinâmica de login, e-mail e senha sugerida.
+  - **Login (SAM):** Padrão `nome.sobrenome` (editável e validado contra limites do AD).
+  - **E-mail:** E-mail corporativo ou intranet `@umuarama.local`.
+  - **CPF:** Registro no atributo `description` do AD e detecção de readmissão.
+  - **Localização (OU):** Dropdown pesquisável com todas as concessionárias e holdings mapeadas (`ou_map.json`).
+- Opção para forçar troca de senha no 1º logon e permissão no grupo `UsuariosVPN`.
 
 ---
 
