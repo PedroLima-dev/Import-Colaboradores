@@ -929,6 +929,101 @@ try {{
 Write-Output "FIM"
 """
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Editar atributos de usuario existente no AD
+# ──────────────────────────────────────────────────────────────────────────────
+def gerar_ps1_editar(sam, servidor_dc, novo_nome="", novo_sobrenome="", novo_email="", novo_cpf="", nova_ou=""):
+    """Gera PS1 para editar atributos basicos de um usuario existente no AD.
+    Emite: EDITAR_OK|sam|detalhe
+           EDITAR_ERRO|sam|mensagem
+    """
+    dc_p          = f'"{servidor_dc}"' if servidor_dc else '""'
+    sam_esc       = sam.replace('"', "'")
+    nome_esc      = novo_nome.replace('"', "'")
+    sobrenome_esc = novo_sobrenome.replace('"', "'")
+    email_esc     = novo_email.replace('"', "'")
+    cpf_esc       = novo_cpf.replace('"', "'")
+    ou_esc        = nova_ou.replace('"', "'")
+    return f"""
+$credUser   = $env:UMU_USER
+$credSenha  = $env:UMU_PASS
+$ServidorDC = {dc_p}
+$BaseDN     = "DC=umuarama,DC=local"
+$SAM        = "{sam_esc}"
+$NovoNome      = "{nome_esc}"
+$NovoSobrenome = "{sobrenome_esc}"
+$NovoEmail     = "{email_esc}"
+$NovoCPF       = "{cpf_esc}"
+$NovaOU        = "{ou_esc}"
+
+function New-Entry([string]$path) {{
+    $escaped = $path -replace '/', '\\/'
+    if ($ServidorDC) {{ $p = "LDAP://$ServidorDC/$escaped" }} else {{ $p = "LDAP://$escaped" }}
+    return New-Object System.DirectoryServices.DirectoryEntry($p, $credUser, $credSenha)
+}}
+
+$ldap = if ($ServidorDC) {{ "LDAP://$ServidorDC/$BaseDN" }} else {{ "LDAP://$BaseDN" }}
+try {{
+    $root = New-Object System.DirectoryServices.DirectoryEntry($ldap, $credUser, $credSenha)
+    if (-not $root.Guid) {{ throw "Falha de autenticacao com o DC." }}
+    $s = New-Object System.DirectoryServices.DirectorySearcher($root)
+    $s.Filter = "(&(objectClass=user)(sAMAccountName=$SAM))"
+    $s.SearchScope = "Subtree"
+    $res = $s.FindOne()
+    if ($res -eq $null) {{ throw "Usuario '$SAM' nao encontrado no AD." }}
+    $u = $res.GetDirectoryEntry()
+
+    $alteracoes = @()
+
+    if ($NovoNome) {{
+        $u.Properties["givenName"].Value = $NovoNome
+        $alteracoes += "Nome: $NovoNome"
+    }}
+    if ($NovoSobrenome) {{
+        $u.Properties["sn"].Value = $NovoSobrenome
+        $alteracoes += "Sobrenome: $NovoSobrenome"
+    }}
+    if ($NovoNome -and $NovoSobrenome) {{
+        $displayName = "$NovoNome $NovoSobrenome"
+        $u.Properties["displayName"].Value = $displayName
+        $u.Properties["name"].Value = $displayName
+    }}
+    if ($NovoEmail) {{
+        $u.Properties["mail"].Value = $NovoEmail
+        $u.Properties["userPrincipalName"].Value = $NovoEmail
+        $alteracoes += "Email: $NovoEmail"
+    }}
+    if ($NovoCPF) {{
+        $u.Properties["description"].Value = $NovoCPF
+        $alteracoes += "CPF: $NovoCPF"
+    }}
+
+    $u.CommitChanges()
+
+    # Mover para nova OU se informada
+    if ($NovaOU) {{
+        try {{
+            $ouEntry = New-Entry $NovaOU
+            if (-not $ouEntry.Guid) {{ throw "OU nao encontrada" }}
+            $u.MoveTo($ouEntry)
+            $ouEntry.Dispose()
+            $alteracoes += "OU movida"
+        }} catch {{
+            Write-Output "EDITAR_AVISO|$SAM|Alteracoes salvas, mas falha ao mover OU: $($_.Exception.Message)"
+        }}
+    }}
+
+    $resumo = $alteracoes -join "; "
+    Write-Output "EDITAR_OK|$SAM|$resumo"
+    $u.Dispose()
+    $root.Dispose()
+}} catch {{
+    Write-Output "EDITAR_ERRO|$SAM|$($_.Exception.Message)"
+}}
+Write-Output "FIM"
+"""
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Modo batch (chamado pelo .bat, sem GUI)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -2324,6 +2419,14 @@ class App(tk.Tk):
             command=self._acao_reativar)
         self._btn_reativar.pack(side="left", padx=(0, 8))
 
+        self._btn_editar = tk.Button(
+            bf_acoes, text="✏️  Editar Dados",
+            bg="#313244", fg="#cba6f7", activebackground="#45475a",
+            font=("Segoe UI", 10), relief="flat", padx=14, pady=5,
+            cursor="hand2", state="disabled",
+            command=self._acao_editar_usuario)
+        self._btn_editar.pack(side="left", padx=(0, 8))
+
         # Guarda referencia as cores para reuso nos metodos de acao
         self._G = {
             "COR_BG": COR_BG, "COR_CARD": COR_CARD, "COR_ACC": COR_ACC,
@@ -2461,6 +2564,7 @@ class App(tk.Tk):
         self._gestao_uac = uac
 
         self._btn_alterar_senha.configure(state="normal")
+        self._btn_editar.configure(state="normal")
         if is_disabled:
             self._btn_desativar.configure(state="disabled")
             self._btn_reativar.configure(state="normal")
@@ -2481,9 +2585,260 @@ class App(tk.Tk):
         self._gestao_sam = ""
         self._gestao_dn  = ""
         self._gestao_uac = 0
-        for btn in ("_btn_alterar_senha", "_btn_desativar", "_btn_reativar"):
+        for btn in ("_btn_alterar_senha", "_btn_desativar", "_btn_reativar", "_btn_editar"):
             if hasattr(self, btn):
                 getattr(self, btn).configure(state="disabled")
+
+    # ── Editar dados do usuário ───────────────────────────────────────────────
+    def _acao_editar_usuario(self):
+        """Abre modal para editar atributos do usuario selecionado no AD."""
+        sam = self._gestao_sam
+        if not sam:
+            messagebox.showwarning("Atenção", "Nenhum colaborador selecionado.", parent=self)
+            return
+
+        G = self._G
+        COR_BG   = G["COR_BG"]
+        COR_CARD = G["COR_CARD"]
+        COR_ACC  = G["COR_ACC"]
+        COR_TXT  = G["COR_TXT"]
+        COR_SUB  = G["COR_SUB"]
+
+        dlg = tk.Toplevel(self)
+        dlg.title(f"Editar Dados — {sam}")
+        dlg.configure(bg=COR_BG)
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        dlg.transient(self)
+
+        # Obtém valores atuais da tela
+        nome_atual  = self.var_g_nome.get().replace("—", "").strip()
+        email_atual = self.var_g_email.get().replace("—", "").strip()
+        cpf_atual   = self.var_g_cpf.get().replace("—", "").strip()
+        ou_atual    = self.var_g_ou.get().replace("—", "").strip()
+
+        # Divide nome em primeiro e sobrenome
+        partes_nome = nome_atual.split(" ", 1)
+        primeiro_atual  = partes_nome[0] if partes_nome else ""
+        sobrenome_atual = partes_nome[1] if len(partes_nome) > 1 else ""
+
+        var_primeiro  = tk.StringVar(value=primeiro_atual)
+        var_sobrenome = tk.StringVar(value=sobrenome_atual)
+        var_email     = tk.StringVar(value=email_atual)
+        var_cpf       = tk.StringVar(value=cpf_atual)
+        var_ou        = tk.StringVar(value=ou_atual)
+        var_ou_dn     = tk.StringVar(value="")
+
+        # Carrega mapa de OUs
+        mapa_ous = {}
+        for (marca, cidade), dn in OU_MAP.items():
+            if dn:
+                caminho = ou_para_caminho(dn)
+                mapa_ous[caminho] = dn
+        lista_ous = sorted(mapa_ous.keys())
+
+        # Tenta pré-selecionar OU atual
+        dn_atual_ou = self._gestao_dn
+        if dn_atual_ou:
+            ou_container = re.sub(r'^CN=[^,]+,\s*', '', dn_atual_ou)
+            caminho_atual = ou_para_caminho(ou_container) if ou_container else ""
+            if caminho_atual in mapa_ous:
+                var_ou.set(caminho_atual)
+                var_ou_dn.set(mapa_ous[caminho_atual])
+
+        # Layout do modal
+        pad = tk.Frame(dlg, bg=COR_BG, padx=18, pady=14)
+        pad.pack(fill="both", expand=True)
+
+        tk.Label(pad, text=f"Editando conta: {sam}", bg=COR_BG, fg=COR_ACC,
+                 font=("Segoe UI", 11, "bold")).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
+
+        campos = [
+            ("Primeiro nome:",  var_primeiro,  False),
+            ("Sobrenome:",      var_sobrenome, False),
+            ("E-mail:",         var_email,     False),
+            ("CPF:",            var_cpf,       False),
+        ]
+        entries = []
+        for i, (lbl, var, readonly) in enumerate(campos):
+            tk.Label(pad, text=lbl, bg=COR_BG, fg=COR_TXT,
+                     font=("Segoe UI", 9, "bold")).grid(row=i+1, column=0, sticky="w", pady=4, padx=(0, 10))
+            e = tk.Entry(pad, textvariable=var, bg="#313244", fg=COR_TXT,
+                         insertbackground=COR_TXT, relief="flat", bd=4,
+                         font=("Segoe UI", 9), width=38,
+                         state=("readonly" if readonly else "normal"))
+            e.grid(row=i+1, column=1, sticky="ew", pady=4)
+            entries.append(e)
+
+        # OU (combobox com filtro)
+        row_ou = len(campos) + 1
+        tk.Label(pad, text="Localização (OU):", bg=COR_BG, fg=COR_TXT,
+                 font=("Segoe UI", 9, "bold")).grid(row=row_ou, column=0, sticky="w", pady=4, padx=(0, 10))
+        cb_ou = ttk.Combobox(pad, textvariable=var_ou, values=lista_ous, width=36)
+        cb_ou.grid(row=row_ou, column=1, sticky="ew", pady=4)
+
+        row_dn = row_ou + 1
+        tk.Label(pad, text="DN no AD:", bg=COR_BG, fg=COR_SUB,
+                 font=("Segoe UI", 8)).grid(row=row_dn, column=0, sticky="w", pady=(0, 4))
+        tk.Label(pad, textvariable=var_ou_dn, bg=COR_BG, fg="#89b4fa",
+                 font=("Segoe UI", 8), wraplength=400, justify="left",
+                 anchor="w").grid(row=row_dn, column=1, sticky="w", pady=(0, 4))
+
+        def _on_ou_sel(_e=None):
+            sel = cb_ou.get().strip()
+            var_ou_dn.set(mapa_ous.get(sel, "OU personalizada / manual"))
+
+        def _filtrar_ou(e=None):
+            if e and e.keysym in ("Up", "Down", "Return", "Escape", "Tab"):
+                return
+            digitado = cb_ou.get().strip().lower()
+            cb_ou["values"] = [o for o in lista_ous if digitado in o.lower()] or [cb_ou.get()]
+            _on_ou_sel()
+
+        cb_ou.bind("<<ComboboxSelected>>", _on_ou_sel)
+        cb_ou.bind("<KeyRelease>", _filtrar_ou)
+
+        pad.columnconfigure(1, weight=1)
+
+        # Aviso
+        tk.Label(pad, text="Deixe um campo em branco para não alterá-lo.",
+                 bg=COR_BG, fg=COR_SUB, font=("Segoe UI", 8)).grid(
+            row=row_dn+1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        # Botões
+        bf = tk.Frame(pad, bg=COR_BG)
+        bf.grid(row=row_dn+2, column=0, columnspan=2, pady=(14, 4))
+
+        def _salvar():
+            self._executar_edicao_usuario(
+                sam=sam,
+                novo_primeiro=var_primeiro.get().strip(),
+                novo_sobrenome=var_sobrenome.get().strip(),
+                novo_email=var_email.get().strip(),
+                novo_cpf=var_cpf.get().strip(),
+                nova_ou_display=var_ou.get().strip(),
+                mapa_ous=mapa_ous,
+                dlg=dlg,
+            )
+
+        tk.Button(bf, text="💾  Salvar Alterações", bg=COR_ACC, fg="#1e1e2e",
+                  activebackground="#7c6fcf", font=("Segoe UI", 10, "bold"),
+                  relief="flat", padx=14, pady=5, cursor="hand2",
+                  command=_salvar).pack(side="left", padx=(0, 10))
+        tk.Button(bf, text="Cancelar", bg="#313244", fg=COR_TXT,
+                  activebackground="#45475a", font=("Segoe UI", 10),
+                  relief="flat", padx=14, pady=5, cursor="hand2",
+                  command=dlg.destroy).pack(side="left")
+
+        # Centraliza o modal sobre a janela principal
+        dlg.update_idletasks()
+        x = self.winfo_x() + (self.winfo_width()  - dlg.winfo_width())  // 2
+        y = self.winfo_y() + (self.winfo_height() - dlg.winfo_height()) // 2
+        dlg.geometry(f"+{x}+{y}")
+
+    def _executar_edicao_usuario(self, sam, novo_primeiro, novo_sobrenome,
+                                  novo_email, novo_cpf, nova_ou_display,
+                                  mapa_ous, dlg):
+        """Executa PS1 para editar atributos do usuario no AD."""
+        nova_ou_dn = ""
+        if nova_ou_display:
+            nova_ou_dn = mapa_ous.get(nova_ou_display, "")
+            if not nova_ou_dn and nova_ou_display.upper().startswith("OU="):
+                nova_ou_dn = nova_ou_display  # DN manual
+
+        if not any([novo_primeiro, novo_sobrenome, novo_email, novo_cpf, nova_ou_dn]):
+            messagebox.showwarning("Atenção", "Nenhum campo alterado. Informe pelo menos um valor.",
+                                   parent=dlg)
+            return
+
+        msg = f"Salvar alterações para '{sam}'?\n\n"
+        if novo_primeiro or novo_sobrenome:
+            msg += f"  Nome: {novo_primeiro} {novo_sobrenome}\n"
+        if novo_email:
+            msg += f"  E-mail: {novo_email}\n"
+        if novo_cpf:
+            msg += f"  CPF: {novo_cpf}\n"
+        if nova_ou_dn:
+            msg += f"  Localização: {nova_ou_display}\n"
+
+        if not messagebox.askyesno("Confirmar edição", msg, parent=dlg):
+            return
+
+        dlg.destroy()
+        self.var_status.set(f"Editando dados de {sam}...")
+        self._log(f"\n[EDITAR] Atualizando dados de '{sam}'...", "titulo")
+
+        user = self._sess_usuario
+        user_pass = self._sess_senha
+        dc = self._resolver_dc()
+
+        def _run():
+            script = gerar_ps1_editar(
+                sam, dc,
+                novo_nome=novo_primeiro,
+                novo_sobrenome=novo_sobrenome,
+                novo_email=novo_email,
+                novo_cpf=novo_cpf,
+                nova_ou=nova_ou_dn,
+            )
+            tmp = tempfile.NamedTemporaryFile(suffix=".ps1", delete=False, mode="w", encoding="utf-8")
+            tmp.write(script); tmp.close()
+            env = os.environ.copy()
+            env["UMU_USER"] = user
+            env["UMU_PASS"] = user_pass
+
+            ok = False
+            detalhe = "Sem resposta do PowerShell."
+            try:
+                proc = subprocess.Popen(
+                    ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", tmp.name],
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    env=env, text=True, encoding="utf-8", errors="replace",
+                    creationflags=subprocess.CREATE_NO_WINDOW
+                )
+                for linha in proc.stdout:
+                    linha = linha.rstrip()
+                    if linha.startswith("EDITAR_OK|"):
+                        partes = linha.split("|", 2)
+                        detalhe = partes[2] if len(partes) > 2 else "Alterações salvas."
+                        ok = True
+                    elif linha.startswith("EDITAR_AVISO|"):
+                        partes = linha.split("|", 2)
+                        self.after(0, lambda m=partes[2] if len(partes) > 2 else "": self._log(f"  ⚠️ {m}", "aviso"))
+                    elif linha.startswith("EDITAR_ERRO|"):
+                        partes = linha.split("|", 2)
+                        detalhe = partes[2] if len(partes) > 2 else "Erro desconhecido."
+                        ok = False
+                    elif linha and linha != "FIM":
+                        self.after(0, lambda m=linha: self._log(f"  {m}", "info"))
+                proc.wait()
+            except Exception as ex:
+                detalhe = str(ex)
+            finally:
+                try:
+                    os.unlink(tmp.name)
+                except OSError:
+                    pass
+
+            def _finalizar():
+                if ok:
+                    self._log(f"  ✅ [{sam}] Dados atualizados: {detalhe}", "ok")
+                    self.var_status.set(f"OK: Dados de {sam} atualizados.")
+                    messagebox.showinfo("Sucesso", f"Dados de '{sam}' atualizados com sucesso!\n\n{detalhe}",
+                                        parent=self)
+                    # Refaz a consulta para atualizar o card
+                    self.var_gestao_termo.set(sam)
+                    self._consultar_usuario()
+                else:
+                    self._log(f"  ❌ [{sam}] Falha ao editar: {detalhe}", "erro")
+                    self.var_status.set(f"Erro ao editar {sam}.")
+                    messagebox.showerror("Erro na edição",
+                        f"Ocorreu um erro ao salvar as alterações:\n\n{detalhe}",
+                        parent=self)
+
+            self.after(0, _finalizar)
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def _abrir_modal_selecao_usuarios(self, lista, termo):
         """Abre modal para o operador escolher quando a busca retorna multiplas contas."""
