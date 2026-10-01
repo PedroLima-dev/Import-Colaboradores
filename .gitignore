@@ -43,3 +43,8 @@ Thumbs.db
 build/
 dist/
 *.spec
+
+old/
+snapshots/
+*.exe
+

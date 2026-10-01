@@ -453,10 +453,11 @@ def gerar_ps1(usuarios, servidor_dc, forcar_troca):
         nome_esc = u["nome"].replace('"', "'")
         sob_esc  = u["sobrenome"].replace('"', "'")
         vpn_val  = "$true" if u.get("vpn") else "$false"
+        senha_esc = u.get("senha", "").replace('"', '`"')
         linhas += (
             f'    @{{Nome="{nome_esc}";Sobrenome="{sob_esc}";'
             f'Login="{u["login"]}";Email="{u["email"]}";'
-            f'OU="{u["ou"]}";CPF="{u["cpf"]}";VPN={vpn_val}}},\n'
+            f'OU="{u["ou"]}";CPF="{u["cpf"]}";VPN={vpn_val};Senha="{senha_esc}"}},\n'
         )
     linhas = linhas.rstrip(",\n")
     dc_p  = f'"{servidor_dc}"' if servidor_dc else '""'
@@ -553,7 +554,7 @@ foreach ($u in $usuarios) {{
     $nomeCompleto = "$($u.Nome) $($u.Sobrenome)".Trim()
     $sam = $u.Login
     $primeiroNome = $u.Nome.Split(" ")[0]
-    $SenhaPadrao = "@" + $primeiroNome.Substring(0,1).ToUpper() + $primeiroNome.Substring(1).ToLower() + "2026"
+    $SenhaPadrao = if ($u.Senha) {{ $u.Senha }} else {{ "@" + $primeiroNome.Substring(0,1).ToUpper() + $primeiroNome.Substring(1).ToLower() + "2026" }}
     Write-Output "INICIO|$sam|$nomeCompleto"
     try {{
         # ── Etapa 1: busca pelo login (sAMAccountName) ──────────────────
@@ -680,7 +681,7 @@ foreach ($u in $usuarios) {{
         $user.Properties["sn"].Value                = $u.Sobrenome
         $user.Properties["displayName"].Value       = $nomeCompleto
         $user.Properties["mail"].Value              = $u.Email
-        $user.Properties["description"].Value       = $u.CPF
+        if ($u.CPF) {{ $user.Properties["description"].Value = $u.CPF }}
         $user.CommitChanges()
         $user.Invoke("SetPassword", $SenhaPadrao)
         $user.Properties["userAccountControl"].Value = 512
@@ -1415,6 +1416,10 @@ class App(tk.Tk):
         tab3 = ttk.Frame(self._nb, style="TFrame")
         self._nb.add(tab3, text="  CONSULTA & GESTÃO AD  ")
         self._build_tab_gestao(tab3, COR_BG, COR_CARD, COR_ACC, COR_TXT, COR_SUB)
+
+        tab4 = ttk.Frame(self._nb, style="TFrame")
+        self._nb.add(tab4, text="  CRIAR USUÁRIO (PJ)  ")
+        self._build_tab_individual(tab4, COR_BG, COR_CARD, COR_ACC, COR_TXT, COR_SUB)
 
         # ── Log compartilhado (abaixo das abas) ────────────────────────────────
         tk.Label(self, text="Log de execucao", bg=COR_BG, fg=COR_SUB,
@@ -2245,6 +2250,8 @@ class App(tk.Tk):
         self._btn_consultar.pack(side="left", padx=6)
         ttk.Button(bf_busca, text="Limpar",
                    command=self._limpar_card_usuario).pack(side="left", padx=6)
+        ttk.Button(bf_busca, text="+ Criar Usuário (PJ)",
+                   command=self._ir_para_criacao_individual).pack(side="left", padx=6)
 
         ent_busca.bind("<Return>",    lambda _e: self._consultar_usuario())
         ent_busca.bind("<KP_Enter>",  lambda _e: self._consultar_usuario())
@@ -2410,8 +2417,14 @@ class App(tk.Tk):
         if resultado is None:
             self.var_status.set("Nenhum colaborador encontrado.")
             self._log("  Nenhum colaborador encontrado para o termo informado.", "aviso")
-            messagebox.showinfo("Não encontrado",
-                                "Nenhuma conta localizada no AD com esse CPF, login ou nome.")
+            resp = messagebox.askyesno(
+                "Não encontrado",
+                "Nenhuma conta localizada no AD com esse CPF, login ou nome.\n\n"
+                "Deseja abrir o formulário para cadastrar como Novo Usuário (PJ / Individual) agora?",
+                parent=self
+            )
+            if resp:
+                self._ir_para_criacao_individual()
             return
         if "erro" in resultado:
             self.var_status.set("Erro na consulta.")
@@ -2816,6 +2829,408 @@ class App(tk.Tk):
 # ──────────────────────────────────────────────────────────────────────────────
 # Entry point
 # ──────────────────────────────────────────────────────────────────────────────
+
+    # ── Aba 4: CRIAR USUÁRIO INDIVIDUAL (PJ / PRESTADOR) ─────────────────────
+    def _build_tab_individual(self, parent, COR_BG, COR_CARD, COR_ACC, COR_TXT, COR_SUB):
+        """Constrói a aba de cadastro individual de usuários (ex: PJ ou terceirizados)."""
+        card = ttk.Frame(parent, style="Card.TFrame", padding=14)
+        card.pack(fill="x", padx=0, pady=6)
+
+        # Variáveis do formulário
+        self.var_indiv_nome  = tk.StringVar()
+        self.var_indiv_login = tk.StringVar()
+        self.var_indiv_email = tk.StringVar()
+        self.var_indiv_cpf   = tk.StringVar()
+        self.var_indiv_ou    = tk.StringVar()
+        self.var_indiv_ou_dn = tk.StringVar(value="Selecione uma localização na lista acima...")
+        self.var_indiv_senha = tk.StringVar()
+        self.var_indiv_troca = tk.BooleanVar(value=True)
+        self.var_indiv_vpn   = tk.BooleanVar(value=False)
+
+        self._indiv_login_manual = False
+        self._indiv_email_manual = False
+        self._indiv_senha_manual = False
+        self._bloquear_auto_indiv = False
+
+        # Prepara OUs legíveis
+        self._carregar_lista_ous_indiv()
+
+        # ── Grid do formulário ──
+        # Linha 0: Nome Completo
+        ttk.Label(card, text="Nome completo:*", background=COR_CARD, font=("Segoe UI", 9, "bold")).grid(
+            row=0, column=0, sticky="w", pady=4)
+        self.ent_indiv_nome = ttk.Entry(card, textvariable=self.var_indiv_nome, width=38)
+        self.ent_indiv_nome.grid(row=0, column=1, padx=(6, 12), sticky="ew", pady=4)
+        ttk.Label(card, text="(Nome e sobrenome — sugere Login, E-mail e Senha)",
+                  background=COR_CARD, foreground=COR_SUB, font=("Segoe UI", 8)).grid(
+            row=0, column=2, columnspan=2, sticky="w", pady=4)
+
+        # Linha 1: Login (SAM) e E-mail
+        ttk.Label(card, text="Login (SAM):*", background=COR_CARD, font=("Segoe UI", 9, "bold")).grid(
+            row=1, column=0, sticky="w", pady=4)
+        self.ent_indiv_login = ttk.Entry(card, textvariable=self.var_indiv_login, width=28)
+        self.ent_indiv_login.grid(row=1, column=1, padx=(6, 12), sticky="w", pady=4)
+
+        ttk.Label(card, text="E-mail:*", background=COR_CARD, font=("Segoe UI", 9, "bold")).grid(
+            row=1, column=2, sticky="w", pady=4, padx=(10, 0))
+        self.ent_indiv_email = ttk.Entry(card, textvariable=self.var_indiv_email, width=36)
+        self.ent_indiv_email.grid(row=1, column=3, padx=(6, 0), sticky="ew", pady=4)
+
+        # Linha 2: CPF e Senha Inicial
+        ttk.Label(card, text="CPF:", background=COR_CARD, font=("Segoe UI", 9, "bold")).grid(
+            row=2, column=0, sticky="w", pady=4)
+        self.ent_indiv_cpf = ttk.Entry(card, textvariable=self.var_indiv_cpf, width=28)
+        self.ent_indiv_cpf.grid(row=2, column=1, padx=(6, 12), sticky="w", pady=4)
+
+        ttk.Label(card, text="Senha inicial:*", background=COR_CARD, font=("Segoe UI", 9, "bold")).grid(
+            row=2, column=2, sticky="w", pady=4, padx=(10, 0))
+
+        frame_senha = tk.Frame(card, bg=COR_CARD)
+        frame_senha.grid(row=2, column=3, sticky="w", padx=(6, 0), pady=4)
+
+        self.ent_indiv_senha = tk.Entry(frame_senha, textvariable=self.var_indiv_senha,
+                                        bg="#313244", fg=COR_TXT, insertbackground=COR_TXT,
+                                        relief="flat", bd=4, font=("Segoe UI", 9), width=20)
+        self.ent_indiv_senha.pack(side="left", padx=(0, 6))
+
+        tk.Button(frame_senha, text="🔄 Regerar", bg="#313244", fg=COR_TXT,
+                  activebackground="#45475a", font=("Segoe UI", 8),
+                  relief="flat", padx=6, pady=2, cursor="hand2",
+                  command=self._regerar_senha_individual).pack(side="left")
+
+        # Linha 3: Localização (OU)
+        ttk.Label(card, text="Localização (OU):*", background=COR_CARD, font=("Segoe UI", 9, "bold")).grid(
+            row=3, column=0, sticky="w", pady=4)
+
+        self.cb_indiv_ou = ttk.Combobox(card, textvariable=self.var_indiv_ou,
+                                        values=self._lista_ous_display,
+                                        width=56)
+        self.cb_indiv_ou.grid(row=3, column=1, columnspan=3, padx=(6, 0), sticky="ew", pady=4)
+        self.cb_indiv_ou.bind("<<ComboboxSelected>>", self._on_indiv_ou_selected)
+        self.cb_indiv_ou.bind("<KeyRelease>", self._filtrar_ous_combobox)
+
+        # Linha 4: DN correspondente
+        ttk.Label(card, text="DN no AD:", background=COR_CARD,
+                  font=("Segoe UI", 8), foreground=COR_SUB).grid(row=4, column=0, sticky="w", pady=(0, 4))
+        self.lbl_indiv_dn = tk.Label(card, textvariable=self.var_indiv_ou_dn,
+                                     bg=COR_CARD, fg="#89b4fa", font=("Segoe UI", 8),
+                                     anchor="w", wraplength=700, justify="left")
+        self.lbl_indiv_dn.grid(row=4, column=1, columnspan=3, sticky="w", padx=(6, 0), pady=(0, 4))
+
+        # Linha 5: Opções
+        frame_opts = tk.Frame(card, bg=COR_CARD)
+        frame_opts.grid(row=5, column=1, columnspan=3, sticky="w", padx=(6, 0), pady=(4, 6))
+
+        tk.Checkbutton(frame_opts, text="Forçar troca de senha no 1º logon",
+                       variable=self.var_indiv_troca, bg=COR_CARD, fg=COR_TXT,
+                       selectcolor="#1e1e2e", activebackground=COR_CARD,
+                       font=("Segoe UI", 9)).pack(side="left", padx=(0, 20))
+
+        tk.Checkbutton(frame_opts, text="Habilitar acesso VPN (Grupo UsuariosVPN)",
+                       variable=self.var_indiv_vpn, bg=COR_CARD, fg=COR_TXT,
+                       selectcolor="#1e1e2e", activebackground=COR_CARD,
+                       font=("Segoe UI", 9)).pack(side="left")
+
+        card.columnconfigure(1, weight=1)
+        card.columnconfigure(3, weight=1)
+
+        # Botões de Ação
+        bf = ttk.Frame(parent, style="TFrame")
+        bf.pack(pady=6)
+
+        self._btn_indiv_criar = ttk.Button(bf, text="Criar Usuário no AD",
+                                           style="Accent.TButton",
+                                           command=self._executar_criacao_individual)
+        self._btn_indiv_criar.pack(side="left", padx=6)
+
+        ttk.Button(bf, text="Limpar Campos",
+                   command=self._limpar_campos_individual).pack(side="left", padx=6)
+
+        # Triggers de automação
+        self.var_indiv_nome.trace_add("write", self._on_indiv_nome_change)
+        self.ent_indiv_login.bind("<Key>", self._marcar_login_manual)
+        self.ent_indiv_email.bind("<Key>", self._marcar_email_manual)
+        self.ent_indiv_senha.bind("<Key>", self._marcar_senha_manual)
+        self.var_indiv_cpf.trace_add("write", self._formatar_cpf_individual)
+
+    def _marcar_login_manual(self, event=None):
+        if event and event.keysym not in ("Shift_L", "Shift_R", "Control_L", "Control_R", "Alt_L", "Alt_R", "Caps_Lock"):
+            self._indiv_login_manual = True
+
+    def _marcar_email_manual(self, event=None):
+        if event and event.keysym not in ("Shift_L", "Shift_R", "Control_L", "Control_R", "Alt_L", "Alt_R", "Caps_Lock"):
+            self._indiv_email_manual = True
+
+    def _marcar_senha_manual(self, event=None):
+        if event and event.keysym not in ("Shift_L", "Shift_R", "Control_L", "Control_R", "Alt_L", "Alt_R", "Caps_Lock"):
+            self._indiv_senha_manual = True
+
+    def _carregar_lista_ous_indiv(self):
+        """Carrega e ordena as OUs mapeadas no ou_map.json."""
+        self._mapa_ous_legiveis = {}
+        for (marca, cidade), dn in OU_MAP.items():
+            if dn:
+                caminho = ou_para_caminho(dn)
+                self._mapa_ous_legiveis[caminho] = dn
+        self._lista_ous_display = sorted(self._mapa_ous_legiveis.keys())
+
+    def _on_indiv_ou_selected(self, _event=None):
+        sel = self.cb_indiv_ou.get().strip()
+        dn = self._mapa_ous_legiveis.get(sel, "")
+        if dn:
+            self.var_indiv_ou_dn.set(dn)
+        else:
+            self.var_indiv_ou_dn.set("OU personalizada / manual")
+
+    def _filtrar_ous_combobox(self, event=None):
+        if event and event.keysym in ("Up", "Down", "Return", "Escape", "Tab"):
+            return
+        digitado = self.cb_indiv_ou.get().strip().lower()
+        if not digitado:
+            self.cb_indiv_ou["values"] = self._lista_ous_display
+            return
+        filtrados = [ou for ou in self._lista_ous_display if digitado in ou.lower()]
+        self.cb_indiv_ou["values"] = filtrados if filtrados else [self.cb_indiv_ou.get()]
+        sel = self.cb_indiv_ou.get().strip()
+        dn = self._mapa_ous_legiveis.get(sel, "")
+        if dn:
+            self.var_indiv_ou_dn.set(dn)
+
+    def _on_indiv_nome_change(self, *args):
+        if self._bloquear_auto_indiv:
+            return
+        nome = self.var_indiv_nome.get()
+        if not self._indiv_login_manual:
+            login = gerar_login(nome)
+            self.var_indiv_login.set(login)
+            if not self._indiv_email_manual:
+                self.var_indiv_email.set(f"{login}@umuarama.local" if login else "")
+        if not self._indiv_senha_manual:
+            if nome.strip():
+                self.var_indiv_senha.set(self._gerar_senha_padrao(nome))
+            else:
+                self.var_indiv_senha.set("")
+
+    def _formatar_cpf_individual(self, *args):
+        val = self.var_indiv_cpf.get()
+        nums = re.sub(r'[^0-9]', '', val)
+        if len(nums) == 11 and "." not in val and "-" not in val:
+            fmt = f"{nums[:3]}.{nums[3:6]}.{nums[6:9]}-{nums[9:]}"
+            self.var_indiv_cpf.set(fmt)
+
+    def _regerar_senha_individual(self):
+        nome = self.var_indiv_nome.get().strip()
+        self.var_indiv_senha.set(self._gerar_senha_padrao(nome) if nome else "@Umuarama2026")
+        self._indiv_senha_manual = False
+
+    def _limpar_campos_individual(self):
+        self._bloquear_auto_indiv = True
+        self.var_indiv_nome.set("")
+        self.var_indiv_login.set("")
+        self.var_indiv_email.set("")
+        self.var_indiv_cpf.set("")
+        self.var_indiv_ou.set("")
+        self.var_indiv_ou_dn.set("Selecione uma localização na lista acima...")
+        self.var_indiv_senha.set("")
+        self.var_indiv_troca.set(True)
+        self.var_indiv_vpn.set(False)
+        self._indiv_login_manual = False
+        self._indiv_email_manual = False
+        self._indiv_senha_manual = False
+        self._bloquear_auto_indiv = False
+        self.cb_indiv_ou["values"] = self._lista_ous_display
+
+    def _ir_para_criacao_individual(self):
+        termo = self.var_gestao_termo.get().strip()
+        self._nb.select(3)
+        if termo:
+            termo_dig = re.sub(r'[^0-9]', '', termo)
+            if len(termo_dig) == 11 or (len(termo_dig) >= 9 and "." in termo):
+                self.var_indiv_cpf.set(termo)
+            elif "." in termo and " " not in termo:
+                self.var_indiv_login.set(termo)
+                self._indiv_login_manual = True
+            else:
+                self.var_indiv_nome.set(termo)
+                self.ent_indiv_nome.focus_set()
+
+    def _executar_criacao_individual(self):
+        nome_completo = self.var_indiv_nome.get().strip()
+        login = self.var_indiv_login.get().strip().lower()
+        email = self.var_indiv_email.get().strip()
+        cpf = self.var_indiv_cpf.get().strip()
+        ou_display = self.cb_indiv_ou.get().strip()
+        senha = self.var_indiv_senha.get().strip()
+        forcar_troca = self.var_indiv_troca.get()
+        vpn = self.var_indiv_vpn.get()
+
+        partes = nome_completo.split()
+        if len(partes) < 2:
+            messagebox.showwarning("Atenção", "Informe o nome completo do colaborador (nome e sobrenome).", parent=self)
+            self.ent_indiv_nome.focus_set()
+            return
+
+        if not login:
+            messagebox.showwarning("Atenção", "Informe o login (SAM) para a conta.", parent=self)
+            self.ent_indiv_login.focus_set()
+            return
+
+        if len(login) > 20:
+            messagebox.showwarning("Atenção", "O login não pode ter mais de 20 caracteres.", parent=self)
+            self.ent_indiv_login.focus_set()
+            return
+
+        if not re.match(r'^[a-zA-Z0-9._\-]+$', login):
+            messagebox.showwarning("Atenção", "O login contém caracteres inválidos. Use apenas letras, números, ponto, hífen ou underline.", parent=self)
+            self.ent_indiv_login.focus_set()
+            return
+
+        if not email:
+            email = f"{login}@umuarama.local"
+            self.var_indiv_email.set(email)
+
+        ou_dn = self._mapa_ous_legiveis.get(ou_display)
+        if not ou_dn:
+            if ou_display.upper().startswith("OU=") and "DC=" in ou_display.upper():
+                ou_dn = ou_display
+            else:
+                messagebox.showwarning("Atenção", "Selecione uma Localização (OU) válida da lista.", parent=self)
+                self.cb_indiv_ou.focus_set()
+                return
+
+        if not senha:
+            senha = self._gerar_senha_padrao(nome_completo)
+            self.var_indiv_senha.set(senha)
+
+        msg_confirm = (
+            f"Confirma a criação do usuário no Active Directory?\n\n"
+            f"• Nome: {nome_completo}\n"
+            f"• Login (SAM): {login}\n"
+            f"• E-mail: {email}\n"
+            f"• CPF: {cpf or '(não informado)'}\n"
+            f"• Localização: {ou_display}\n"
+            f"• Senha inicial: {senha}\n"
+            f"• Forçar troca de senha: {'Sim' if forcar_troca else 'Não'}\n"
+            f"• Acesso VPN: {'Sim' if vpn else 'Não'}"
+        )
+        if not messagebox.askyesno("Confirmar criação de usuário", msg_confirm, parent=self):
+            return
+
+        self._btn_indiv_criar.configure(state="disabled")
+        self.var_status.set(f"Criando usuário {login} no Active Directory...")
+        self._log(f"\n[PJ / INDIVIDUAL] Criando conta de '{nome_completo}' ({login})...", "titulo")
+
+        primeiro = partes[0]
+        sobrenome = " ".join(partes[1:])
+        u_data = {
+            "nome": primeiro,
+            "sobrenome": sobrenome,
+            "login": login,
+            "email": email,
+            "ou": ou_dn,
+            "cpf": cpf,
+            "vpn": vpn,
+            "senha": senha,
+        }
+
+        user = self._sess_usuario
+        user_pass = self._sess_senha
+        dc = self._resolver_dc()
+
+        def _run():
+            script = gerar_ps1([u_data], dc, forcar_troca)
+            tmp = tempfile.NamedTemporaryFile(suffix=".ps1", delete=False, mode="w", encoding="utf-8")
+            tmp.write(script); tmp.close()
+            env = os.environ.copy()
+            env["UMU_USER"] = user
+            env["UMU_PASS"] = user_pass
+
+            resultado_status = "ERRO"
+            resultado_detalhe = "Sem resposta do PowerShell."
+            vpn_status = "NAO"
+
+            try:
+                proc = subprocess.Popen(
+                    ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", tmp.name],
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    env=env, text=True, encoding="utf-8", errors="replace",
+                    creationflags=subprocess.CREATE_NO_WINDOW
+                )
+                for linha in proc.stdout:
+                    linha = linha.rstrip()
+                    if linha.startswith("RESULTADO|"):
+                        partes_res = linha.split("|", 3)
+                        if len(partes_res) >= 4:
+                            _, sam_res, status_res, det_res = partes_res
+                            resultado_status = status_res
+                            resultado_detalhe = det_res
+                    elif linha.startswith("VPN_OK|"):
+                        vpn_status = "SIM"
+                    elif linha.startswith("VPN_ERRO|"):
+                        partes_vpn = linha.split("|", 2)
+                        vpn_status = f"ERRO: {partes_vpn[2] if len(partes_vpn) > 2 else ''}"
+                    elif linha == "FIM":
+                        break
+                proc.wait()
+            finally:
+                try:
+                    os.unlink(tmp.name)
+                except OSError:
+                    pass
+
+            def _finalizar():
+                self._btn_indiv_criar.configure(state="normal")
+                caminho_legivel = ou_para_caminho(ou_dn)
+
+                if resultado_status in ("OK", "OK_ATIVADO", "OK_EXISTE_ATIVO", "OK_READMITIDO"):
+                    if resultado_status == "OK":
+                        msg_sucesso = f"Usuário '{login}' criado com sucesso no Active Directory!"
+                        self._log(f"  ✔ [CRIADO] {nome_completo} ({login}) → {caminho_legivel}", "ok")
+                    elif resultado_status == "OK_READMITIDO":
+                        msg_sucesso = f"Colaborador com CPF '{cpf}' readmitido! Conta reativada, movida e senha redefinida."
+                        self._log(f"  ✔ [READMITIDO] CPF {cpf} reativado para {login} → {caminho_legivel}", "ok")
+                    elif resultado_status == "OK_ATIVADO":
+                        msg_sucesso = f"A conta '{login}' já existia desativada e foi reativada com sucesso!"
+                        self._log(f"  ✔ [REATIVADO] Conta {login} reativada → {caminho_legivel}", "ok")
+                    else:
+                        msg_sucesso = f"A conta '{login}' já existe e está ativa no AD."
+                        self._log(f"  ℹ [JÁ ATIVO] Conta {login} já existe ativa no AD.", "info")
+
+                    if vpn:
+                        if vpn_status == "SIM":
+                            self._log(f"  ✔ [VPN] Adicionado com sucesso ao grupo 'UsuariosVPN'.", "ok")
+                        elif vpn_status.startswith("ERRO:"):
+                            self._log(f"  ⚠ [VPN] Falha ao adicionar ao grupo VPN: {vpn_status[5:]}", "aviso")
+
+                    self.var_status.set(f"OK: Conta {login} processada com sucesso.")
+                    messagebox.showinfo("Sucesso", f"{msg_sucesso}\n\n"
+                                                  f"• Login: {login}\n"
+                                                  f"• Nome: {nome_completo}\n"
+                                                  f"• E-mail: {email}\n"
+                                                  f"• Senha inicial: {senha}\n"
+                                                  f"• Localização: {caminho_legivel}", parent=self)
+                elif resultado_status in ("JA_EXISTE", "CONFLITO_NOME"):
+                    self._log(f"  ⚠ [CONFLITO LOGIN] O login '{login}' já existe no AD para outro usuário.", "aviso")
+                    self.var_status.set(f"Conflito: login {login} já em uso.")
+                    messagebox.showwarning("Login em uso",
+                        f"O login '{login}' já está em uso por outro usuário no Active Directory.\n\n"
+                        f"Por favor, altere o campo Login (SAM) para outro identificador.", parent=self)
+                elif resultado_status == "CONFLITO_CPF":
+                    self._log(f"  ⚠ [CONFLITO CPF] O CPF '{cpf}' já está associado a outra conta ativa no AD.", "aviso")
+                    self.var_status.set(f"Conflito: CPF {cpf} já cadastrado em conta ativa.")
+                    messagebox.showwarning("CPF já cadastrado",
+                        f"O CPF '{cpf}' já está cadastrado em outra conta ativa no Active Directory.\n"
+                        f"Consulte o colaborador na aba 'CONSULTA & GESTÃO AD'.", parent=self)
+                else:
+                    self._log(f"  ✘ [ERRO] Falha ao criar usuário '{login}': {resultado_detalhe}", "erro")
+                    self.var_status.set(f"Erro ao criar usuário {login}.")
+                    messagebox.showerror("Erro na criação",
+                        f"Ocorreu um erro ao criar o usuário no Active Directory:\n\n{resultado_detalhe}", parent=self)
+
+            self.after(0, _finalizar)
+
+        threading.Thread(target=_run, daemon=True).start()
+
 if __name__ == "__main__":
     if "--modo-bat" in sys.argv:
         parser = argparse.ArgumentParser()
